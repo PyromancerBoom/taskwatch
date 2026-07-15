@@ -7,10 +7,12 @@ import (
 	"taskwatch/internal/core"
 )
 
+const packagedCodexDesktopPath = `C:\Program Files\WindowsApps\OpenAI.Codex_26.707.9981.0_x64__2p2nqsd0c76g0\app\resources\codex.exe`
+
 func TestGroupCodexDesktopFindsRootsAndDescendants(t *testing.T) {
 	created := time.Unix(100, 0).UTC()
 	processes := []ProcessDetails{
-		{Process: core.Process{PID: 10, ParentPID: 1, Name: "CODEX.EXE", CreatedAt: created}},
+		{Process: core.Process{PID: 10, ParentPID: 1, Name: "CODEX.EXE", CreatedAt: created}, ExecutablePath: packagedCodexDesktopPath},
 		{Process: core.Process{PID: 11, ParentPID: 10, Name: "renderer.exe", CreatedAt: created.Add(time.Second)}},
 		{Process: core.Process{PID: 12, ParentPID: 11, Name: "worker.exe", CreatedAt: created.Add(2 * time.Second)}},
 		{Process: core.Process{PID: 20, ParentPID: 1, Name: "other.exe", CreatedAt: created}},
@@ -31,9 +33,9 @@ func TestGroupCodexDesktopFindsRootsAndDescendants(t *testing.T) {
 func TestGroupCodexDesktopExcludesSupervisedTreesAndNestedCodexRoots(t *testing.T) {
 	created := time.Unix(100, 0).UTC()
 	processes := []ProcessDetails{
-		{Process: core.Process{PID: 10, ParentPID: 1, Name: "Codex.exe", CreatedAt: created}},
-		{Process: core.Process{PID: 11, ParentPID: 10, Name: "Codex.exe", CreatedAt: created.Add(time.Second)}},
-		{Process: core.Process{PID: 20, ParentPID: 1, Name: "Codex.exe", CreatedAt: created}},
+		{Process: core.Process{PID: 10, ParentPID: 1, Name: "Codex.exe", CreatedAt: created}, ExecutablePath: packagedCodexDesktopPath},
+		{Process: core.Process{PID: 11, ParentPID: 10, Name: "Codex.exe", CreatedAt: created.Add(time.Second)}, ExecutablePath: packagedCodexDesktopPath},
+		{Process: core.Process{PID: 20, ParentPID: 1, Name: "Codex.exe", CreatedAt: created}, ExecutablePath: packagedCodexDesktopPath},
 	}
 
 	got := GroupCodexDesktop(processes, map[uint32]core.ProcessIdentity{20: processes[2].Process.Identity()})
@@ -45,7 +47,7 @@ func TestGroupCodexDesktopExcludesSupervisedTreesAndNestedCodexRoots(t *testing.
 func TestGroupCodexDesktopDoesNotExcludeReusedSupervisedPID(t *testing.T) {
 	oldCreation := time.Unix(100, 0).UTC()
 	reusedCreation := oldCreation.Add(time.Hour)
-	processes := []ProcessDetails{{Process: core.Process{PID: 20, ParentPID: 1, Name: "Codex.exe", CreatedAt: reusedCreation}, MetadataAccessible: true}}
+	processes := []ProcessDetails{{Process: core.Process{PID: 20, ParentPID: 1, Name: "Codex.exe", CreatedAt: reusedCreation}, ExecutablePath: packagedCodexDesktopPath, MetadataAccessible: true}}
 
 	got := GroupCodexDesktop(processes, map[uint32]core.ProcessIdentity{20: {PID: 20, CreatedAt: oldCreation}})
 	if len(got) != 1 || got[0].Root.PID != 20 {
@@ -56,7 +58,7 @@ func TestGroupCodexDesktopDoesNotExcludeReusedSupervisedPID(t *testing.T) {
 func TestGroupCodexDesktopMarksMetadataFailuresInaccessibleAndOmitsIdentitylessDescendants(t *testing.T) {
 	created := time.Unix(100, 0).UTC()
 	processes := []ProcessDetails{
-		{Process: core.Process{PID: 10, ParentPID: 1, Name: "Codex.exe", CreatedAt: created}, MetadataAccessible: false, MetadataError: "access denied"},
+		{Process: core.Process{PID: 10, ParentPID: 1, Name: "Codex.exe", CreatedAt: created}, ExecutablePath: packagedCodexDesktopPath, MetadataAccessible: true, MetadataError: "command line: access denied"},
 		{Process: core.Process{PID: 11, ParentPID: 10, Name: "unknown.exe"}, MetadataAccessible: false, MetadataError: "access denied"},
 	}
 
@@ -76,8 +78,8 @@ func TestGroupCodexDesktopDoesNotSuppressOlderRootBehindReusedNewerParentPID(t *
 	older := time.Unix(100, 0).UTC()
 	newer := older.Add(time.Hour)
 	processes := []ProcessDetails{
-		{Process: core.Process{PID: 10, ParentPID: 20, Name: "Codex.exe", CreatedAt: older}, MetadataAccessible: true},
-		{Process: core.Process{PID: 20, ParentPID: 1, Name: "Codex.exe", CreatedAt: newer}, MetadataAccessible: true},
+		{Process: core.Process{PID: 10, ParentPID: 20, Name: "Codex.exe", CreatedAt: older}, ExecutablePath: packagedCodexDesktopPath, MetadataAccessible: true},
+		{Process: core.Process{PID: 20, ParentPID: 1, Name: "Codex.exe", CreatedAt: newer}, ExecutablePath: packagedCodexDesktopPath, MetadataAccessible: true},
 	}
 
 	got := GroupCodexDesktop(processes, nil)
@@ -92,7 +94,7 @@ func TestGroupCodexDesktopDoesNotSuppressOlderRootBehindReusedNewerParentPID(t *
 func TestGroupCodexDesktopIgnoresInvalidEdgesWhenDerivingInaccessibleState(t *testing.T) {
 	created := time.Unix(200, 0).UTC()
 	processes := []ProcessDetails{
-		{Process: core.Process{PID: 20, ParentPID: 1, Name: "Codex.exe", CreatedAt: created}, MetadataAccessible: true},
+		{Process: core.Process{PID: 20, ParentPID: 1, Name: "Codex.exe", CreatedAt: created}, ExecutablePath: packagedCodexDesktopPath, MetadataAccessible: true},
 		{
 			Process:            core.Process{PID: 10, ParentPID: 20, Name: "older-unrelated.exe", CreatedAt: created.Add(-time.Hour)},
 			MetadataAccessible: false,
@@ -122,10 +124,12 @@ func TestGroupCodexDesktopRejectsIdentitylessParentEdge(t *testing.T) {
 	processes := []ProcessDetails{
 		{
 			Process:            core.Process{PID: 10, ParentPID: 20, Name: "Codex.exe", CreatedAt: created},
+			ExecutablePath:     packagedCodexDesktopPath,
 			MetadataAccessible: true,
 		},
 		{
 			Process:            core.Process{PID: 20, ParentPID: 1, Name: "Codex.exe"},
+			ExecutablePath:     packagedCodexDesktopPath,
 			MetadataAccessible: false,
 			MetadataError:      "creation time unavailable",
 		},
@@ -140,5 +144,26 @@ func TestGroupCodexDesktopRejectsIdentitylessParentEdge(t *testing.T) {
 	}
 	if got[1].Root.PID != 20 || got[1].State != core.StateInaccessible || len(got[1].Processes) != 0 {
 		t.Fatalf("identity-less parent session = %#v, want non-terminable inaccessible root PID 20", got[1])
+	}
+}
+
+func TestGroupCodexDesktopIgnoresCodexCLIExecutablePath(t *testing.T) {
+	processes := []ProcessDetails{{
+		Process:        core.Process{PID: 10, ParentPID: 1, Name: "codex.exe", CreatedAt: time.Unix(100, 0).UTC()},
+		ExecutablePath: `C:\Users\developer\AppData\Roaming\npm\node_modules\@openai\codex\vendor\x86_64-pc-windows-msvc\codex.exe`,
+	}}
+
+	if got := GroupCodexDesktop(processes, nil); len(got) != 0 {
+		t.Fatalf("GroupCodexDesktop() = %#v, want CLI executable ignored", got)
+	}
+}
+
+func TestGroupCodexDesktopIgnoresCodexExecutableWithoutPath(t *testing.T) {
+	processes := []ProcessDetails{{
+		Process: core.Process{PID: 10, ParentPID: 1, Name: "codex.exe", CreatedAt: time.Unix(100, 0).UTC()},
+	}}
+
+	if got := GroupCodexDesktop(processes, nil); len(got) != 0 {
+		t.Fatalf("GroupCodexDesktop() = %#v, want uncertain executable ignored", got)
 	}
 }

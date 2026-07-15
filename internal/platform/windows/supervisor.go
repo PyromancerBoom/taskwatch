@@ -33,7 +33,6 @@ type nativeOperations interface {
 	terminateProcess(process nativeHandle) error
 	closeHandle(nativeHandle)
 	jobProcessIDs(job nativeHandle) ([]uint32, error)
-	terminateJob(job nativeHandle) error
 	openProcessForTerminate(pid uint32) (nativeHandle, error)
 	terminateOpenedProcess(process nativeHandle) error
 }
@@ -213,8 +212,9 @@ func (supervisor *Supervisor) jobHandle(name string) (nativeHandle, error) {
 	return handle, nil
 }
 
-// TerminateSupervised force-terminates a named job only after explicit
-// confirmation. Job membership is the authoritative supervised boundary.
+// TerminateSupervised terminates only the exact job members captured by an
+// explicitly confirmed request. Members that appear later are left running
+// for another review.
 func (supervisor *Supervisor) TerminateSupervised(request core.TerminationRequest, session core.Session) error {
 	if !request.Confirmed() {
 		return errors.New("termination request is not confirmed")
@@ -228,17 +228,87 @@ func (supervisor *Supervisor) TerminateSupervised(request core.TerminationReques
 	if session.Confidence != core.ConfidenceSupervised || session.JobName == "" {
 		return errors.New("invalid supervised session")
 	}
-	if err := core.RevalidateObserved(request, session.Processes); err != nil {
-		return fmt.Errorf("validate supervised session targets: %w", err)
-	}
-	job, err := supervisor.jobHandle(session.JobName)
+	current, err := supervisor.Refresh(session)
 	if err != nil {
-		return fmt.Errorf("open job for termination: %w", err)
+		return fmt.Errorf("refresh supervised session for termination: %w", err)
 	}
-	if err := supervisor.native.terminateJob(job); err != nil {
-		return fmt.Errorf("terminate job: %w", err)
+	if current.State == core.StateInaccessible {
+		return errors.New("current supervised session membership is inaccessible")
+	}
+	if err := core.RevalidateObserved(request, current.Processes); err != nil {
+		return fmt.Errorf("revalidate supervised session targets: %w", err)
+	}
+	return supervisor.terminateExactProcesses(current.Processes)
+}
+
+type openedProcess struct {
+	process core.Process
+	handle  nativeHandle
+}
+
+func (supervisor *Supervisor) terminateExactProcesses(processes []core.Process) error {
+	opened := make([]openedProcess, 0, len(processes))
+	for _, process := range processes {
+		handle, err := supervisor.native.openProcessForTerminate(process.PID)
+		if err != nil {
+			supervisor.closeOpenedProcesses(opened)
+			return fmt.Errorf("preflight PID %d: %w", process.PID, err)
+		}
+		opened = append(opened, openedProcess{process: process, handle: handle})
+		createdAt, err := supervisor.native.processCreatedAt(handle)
+		if err != nil {
+			supervisor.closeOpenedProcesses(opened)
+			return fmt.Errorf("preflight identity for PID %d: %w", process.PID, err)
+		}
+		if !core.SameProcess(process.Identity(), core.ProcessIdentity{PID: process.PID, CreatedAt: createdAt}) {
+			supervisor.closeOpenedProcesses(opened)
+			return fmt.Errorf("preflight identity for PID %d changed", process.PID)
+		}
+	}
+	defer supervisor.closeOpenedProcesses(opened)
+
+	byPID := make(map[uint32]core.Process, len(processes))
+	for _, process := range processes {
+		byPID[process.PID] = process
+	}
+	sort.SliceStable(opened, func(i, j int) bool {
+		leftDepth := processDepth(opened[i].process, byPID)
+		rightDepth := processDepth(opened[j].process, byPID)
+		if leftDepth != rightDepth {
+			return leftDepth > rightDepth
+		}
+		return opened[i].process.PID > opened[j].process.PID
+	})
+	for _, target := range opened {
+		if err := supervisor.native.terminateOpenedProcess(target.handle); err != nil {
+			return fmt.Errorf("terminate supervised PID %d: %w", target.process.PID, err)
+		}
 	}
 	return nil
+}
+
+func (supervisor *Supervisor) closeOpenedProcesses(processes []openedProcess) {
+	for _, process := range processes {
+		supervisor.native.closeHandle(process.handle)
+	}
+}
+
+func processDepth(process core.Process, byPID map[uint32]core.Process) int {
+	depth := 0
+	seen := map[uint32]struct{}{process.PID: {}}
+	child := process
+	for {
+		parent, exists := byPID[child.ParentPID]
+		if !exists || !validObservedEdge(parent, child) {
+			return depth
+		}
+		if _, cycle := seen[parent.PID]; cycle {
+			return depth
+		}
+		seen[parent.PID] = struct{}{}
+		depth++
+		child = parent
+	}
 }
 
 // TerminateObserved re-snapshots the tree, checks exact PID+creation identity,

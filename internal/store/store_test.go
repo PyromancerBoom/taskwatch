@@ -52,10 +52,6 @@ func TestSaveAndLoadRoundTripSupervisedSessionsOnly(t *testing.T) {
 	if got[0].Root.PID != 42 || !got[0].Root.CreatedAt.Equal(rootCreated) || !got[0].StartedAt.Equal(started) {
 		t.Fatalf("Load() identity/times = %#v, want PID 42 created at %v and session started at %v", got[0], rootCreated, started)
 	}
-	if pruned := PruneStale(got, []core.Process{{PID: 42, CreatedAt: rootCreated}}); len(pruned) != 1 {
-		t.Fatalf("PruneStale() removed round-tripped live root: %#v", pruned)
-	}
-
 	raw, err := os.ReadFile(path)
 	if err != nil {
 		t.Fatalf("ReadFile() error = %v", err)
@@ -92,23 +88,26 @@ func TestLoadRejectsUnsupportedSchema(t *testing.T) {
 	}
 }
 
-func TestPruneStaleKeepsOnlySessionsWhoseRootIdentityIsLive(t *testing.T) {
+func TestLoadKeepsMetadataForJobRecoveryWithoutALiveRootSnapshot(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "sessions.json")
 	created := time.Unix(100, 0).UTC()
-	records := []core.Session{
-		{ID: "live", Confidence: core.ConfidenceSupervised, Root: core.ProcessIdentity{PID: 10, CreatedAt: created}, StartedAt: created},
-		{ID: "reused", Confidence: core.ConfidenceSupervised, Root: core.ProcessIdentity{PID: 11, CreatedAt: created}, StartedAt: created},
-		{ID: "gone", Confidence: core.ConfidenceSupervised, Root: core.ProcessIdentity{PID: 12, CreatedAt: created}, StartedAt: created},
+	session := core.Session{
+		ID:         "leftovers",
+		Tool:       core.ToolCodexCLI,
+		Confidence: core.ConfidenceSupervised,
+		JobName:    `Local\TaskWatch-leftovers`,
+		Root:       core.ProcessIdentity{PID: 42, CreatedAt: created},
+		StartedAt:  created,
 	}
-	processes := []core.Process{
-		{PID: 10, CreatedAt: created},
-		{PID: 11, CreatedAt: created.Add(time.Minute)},
+	if err := Save(path, []core.Session{session}); err != nil {
+		t.Fatalf("Save() error = %v", err)
 	}
 
-	got := PruneStale(records, processes)
-	if len(got) != 1 || got[0].ID != "live" {
-		t.Fatalf("PruneStale() = %#v, want only live record", got)
+	got, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
 	}
-	if len(processes) != 2 {
-		t.Fatalf("PruneStale() modified process snapshot: %#v", processes)
+	if len(got) != 1 || got[0].ID != session.ID || got[0].JobName != session.JobName || !core.SameProcess(got[0].Root, session.Root) {
+		t.Fatalf("Load() = %#v, want metadata retained for named-job recovery", got)
 	}
 }

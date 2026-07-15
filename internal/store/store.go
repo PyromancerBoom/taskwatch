@@ -150,21 +150,3 @@ func ensureJSONEOF(decoder *json.Decoder) error {
 	}
 	return fmt.Errorf("session store contains multiple JSON values")
 }
-
-// PruneStale is a pure filter over an already-collected process snapshot. It
-// performs no process operations.
-func PruneStale(sessions []core.Session, processes []core.Process) []core.Session {
-	live := make(map[uint32]core.ProcessIdentity, len(processes))
-	for _, process := range processes {
-		live[process.PID] = process.Identity()
-	}
-
-	kept := make([]core.Session, 0, len(sessions))
-	for _, session := range sessions {
-		identity, exists := live[session.Root.PID]
-		if exists && core.SameProcess(session.Root, identity) {
-			kept = append(kept, session)
-		}
-	}
-	return kept
-}

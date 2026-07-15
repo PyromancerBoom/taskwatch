@@ -35,19 +35,17 @@ func (observer *Observer) Observe(supervisedProcesses map[uint32]core.ProcessIde
 func GroupCodexDesktop(snapshot []ProcessDetails, supervisedProcesses map[uint32]core.ProcessIdentity) []core.Session {
 	processes := make([]core.Process, 0, len(snapshot))
 	detailsByPID := make(map[uint32]ProcessDetails, len(snapshot))
-	byPID := make(map[uint32]core.Process, len(snapshot))
 	for _, detail := range snapshot {
 		if supervised, exists := supervisedProcesses[detail.Process.PID]; exists && core.SameProcess(supervised, detail.Process.Identity()) {
 			continue
 		}
 		processes = append(processes, detail.Process)
 		detailsByPID[detail.Process.PID] = detail
-		byPID[detail.Process.PID] = detail.Process
 	}
 
 	rootCandidates := make([]core.Process, 0)
 	for _, process := range processes {
-		if !isCodexDesktop(process) || hasCodexAncestor(process, byPID) {
+		if !isCodexDesktop(detailsByPID[process.PID]) || hasCodexAncestor(process, detailsByPID) {
 			continue
 		}
 		rootCandidates = append(rootCandidates, process)
@@ -108,11 +106,30 @@ func observedTreeInaccessible(rootPID uint32, detailsByPID map[uint32]ProcessDet
 	return false
 }
 
-func isCodexDesktop(process core.Process) bool {
-	return strings.EqualFold(filepath.Base(process.Name), "Codex.exe")
+func isCodexDesktop(detail ProcessDetails) bool {
+	if !strings.EqualFold(filepath.Base(detail.Process.Name), "Codex.exe") || detail.ExecutablePath == "" {
+		return false
+	}
+	path := strings.ToLower(strings.ReplaceAll(filepath.Clean(detail.ExecutablePath), "/", `\`))
+	const packageRoot = `:\program files\windowsapps\openai.codex_`
+	rootIndex := strings.Index(path, packageRoot)
+	if rootIndex != 1 {
+		return false
+	}
+	packageStart := rootIndex + len(packageRoot)
+	packageEndOffset := strings.IndexByte(path[packageStart:], '\\')
+	if packageEndOffset == -1 {
+		return false
+	}
+	packageEnd := packageStart + packageEndOffset
+	packageID := path[packageStart:packageEnd]
+	if !strings.HasSuffix(packageID, "__2p2nqsd0c76g0") {
+		return false
+	}
+	return path[packageEnd:] == `\app\resources\codex.exe`
 }
 
-func hasCodexAncestor(process core.Process, byPID map[uint32]core.Process) bool {
+func hasCodexAncestor(process core.Process, detailsByPID map[uint32]ProcessDetails) bool {
 	seen := map[uint32]struct{}{process.PID: {}}
 	child := process
 	parentPID := process.ParentPID
@@ -121,14 +138,15 @@ func hasCodexAncestor(process core.Process, byPID map[uint32]core.Process) bool 
 			return false
 		}
 		seen[parentPID] = struct{}{}
-		parent, exists := byPID[parentPID]
+		parentDetail, exists := detailsByPID[parentPID]
 		if !exists {
 			return false
 		}
+		parent := parentDetail.Process
 		if !validObservedEdge(parent, child) {
 			return false
 		}
-		if isCodexDesktop(parent) {
+		if isCodexDesktop(parentDetail) {
 			return true
 		}
 		child = parent

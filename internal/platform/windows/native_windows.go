@@ -14,12 +14,11 @@ import (
 )
 
 const (
-	jobObjectQuery                = 0x0004
-	jobObjectTerminate            = 0x0008
-	jobObjectBasicProcessIDList   = 3
-	processTerminateAccess        = 0x0001
-	observedTerminationExitCode   = 1
-	supervisedTerminationExitCode = 1
+	jobObjectQuery              = 0x0004
+	jobObjectBasicProcessIDList = 3
+	processTerminateAccess      = 0x0001
+	observedTerminationExitCode = 1
+	launchCleanupExitCode       = 1
 )
 
 var (
@@ -44,7 +43,7 @@ func (nativeWindows) openJob(name string) (nativeHandle, error) {
 		return 0, err
 	}
 	handle, _, callErr := procOpenJobObject.Call(
-		uintptr(jobObjectQuery|jobObjectTerminate),
+		uintptr(jobObjectQuery),
 		0,
 		uintptr(unsafe.Pointer(namePointer)),
 	)
@@ -122,7 +121,7 @@ func (nativeWindows) processCreatedAt(process nativeHandle) (time.Time, error) {
 }
 
 func (nativeWindows) terminateProcess(process nativeHandle) error {
-	return winapi.TerminateProcess(winapi.Handle(process), supervisedTerminationExitCode)
+	return winapi.TerminateProcess(winapi.Handle(process), launchCleanupExitCode)
 }
 
 func (nativeWindows) closeHandle(handle nativeHandle) {
@@ -166,10 +165,6 @@ func (nativeWindows) jobProcessIDs(job nativeHandle) ([]uint32, error) {
 		}
 		return pids, nil
 	}
-}
-
-func (nativeWindows) terminateJob(job nativeHandle) error {
-	return winapi.TerminateJobObject(winapi.Handle(job), supervisedTerminationExitCode)
 }
 
 func (nativeWindows) openProcessForTerminate(pid uint32) (nativeHandle, error) {

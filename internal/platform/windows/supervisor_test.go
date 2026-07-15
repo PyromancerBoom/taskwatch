@@ -76,10 +76,6 @@ func (native *fakeNative) jobProcessIDs(nativeHandle) ([]uint32, error) {
 	native.events = append(native.events, "job-pids")
 	return append([]uint32(nil), native.jobPIDs...), nil
 }
-func (native *fakeNative) terminateJob(nativeHandle) error {
-	native.events = append(native.events, "terminate-job")
-	return nil
-}
 func (native *fakeNative) openProcessForTerminate(pid uint32) (nativeHandle, error) {
 	native.openedForTerminate = append(native.openedForTerminate, pid)
 	if pid == native.failOpenPID {
@@ -201,11 +197,24 @@ func TestTerminateSupervisedRejectsConfirmedEmptyRequest(t *testing.T) {
 	}
 }
 
-func TestTerminateSupervisedUsesJobFromBoundSession(t *testing.T) {
+func TestTerminateSupervisedTerminatesOnlyExactConfirmedTargets(t *testing.T) {
 	created := time.Unix(100, 0).UTC()
-	processes := []core.Process{{PID: 42, CreatedAt: created}}
-	native := &fakeNative{}
-	supervisor := newSupervisor(&fakeResolver{}, native, &fakeSnapshotter{})
+	processes := []core.Process{
+		{PID: 42, CreatedAt: created},
+		{PID: 43, ParentPID: 42, CreatedAt: created.Add(time.Second)},
+	}
+	native := &fakeNative{
+		jobPIDs: []uint32{42, 43},
+		createdByPID: map[uint32]time.Time{
+			42: created,
+			43: created.Add(time.Second),
+		},
+	}
+	snapshotter := &fakeSnapshotter{processes: []ProcessDetails{
+		{Process: processes[0], MetadataAccessible: true},
+		{Process: processes[1], MetadataAccessible: true},
+	}}
+	supervisor := newSupervisor(&fakeResolver{}, native, snapshotter)
 	session := core.Session{
 		ID:         "session-a",
 		Confidence: core.ConfidenceSupervised,
@@ -217,8 +226,123 @@ func TestTerminateSupervisedUsesJobFromBoundSession(t *testing.T) {
 	if err := supervisor.TerminateSupervised(request, session); err != nil {
 		t.Fatalf("TerminateSupervised() error = %v", err)
 	}
-	if index(native.events, "open-job") == -1 || index(native.events, "terminate-job") == -1 {
-		t.Fatalf("native events = %v, want bound job opened and terminated", native.events)
+	if !reflect.DeepEqual(native.openedForTerminate, []uint32{42, 43}) {
+		t.Fatalf("preflight opens = %v, want exact confirmed targets", native.openedForTerminate)
+	}
+	if !reflect.DeepEqual(native.terminatedPIDs, []uint32{43, 42}) {
+		t.Fatalf("terminated PIDs = %v, want exact targets child-first", native.terminatedPIDs)
+	}
+	if index(native.events, "terminate-job") != -1 {
+		t.Fatalf("native events = %v, must not terminate the whole job", native.events)
+	}
+}
+
+func TestTerminateSupervisedRejectsJobMemberAddedAfterConfirmation(t *testing.T) {
+	created := time.Unix(100, 0).UTC()
+	confirmed := []core.Process{{PID: 42, CreatedAt: created}}
+	current := []ProcessDetails{
+		{Process: confirmed[0], MetadataAccessible: true},
+		{Process: core.Process{PID: 43, ParentPID: 42, CreatedAt: created.Add(time.Second)}, MetadataAccessible: true},
+	}
+	native := &fakeNative{jobPIDs: []uint32{42, 43}}
+	supervisor := newSupervisor(&fakeResolver{}, native, &fakeSnapshotter{processes: current})
+	session := core.Session{
+		ID:         "session-a",
+		Confidence: core.ConfidenceSupervised,
+		JobName:    "TaskWatch-a",
+		Processes:  confirmed,
+	}
+	request := core.NewTerminationRequest(session.ID, confirmed).Confirm()
+
+	if err := supervisor.TerminateSupervised(request, session); err == nil {
+		t.Fatal("TerminateSupervised() accepted a job member added after confirmation")
+	}
+	if len(native.openedForTerminate) != 0 || len(native.terminatedPIDs) != 0 || index(native.events, "terminate-job") != -1 {
+		t.Fatalf("opened/terminated/events = %v/%v/%v, want zero process termination", native.openedForTerminate, native.terminatedPIDs, native.events)
+	}
+}
+
+func TestTerminateSupervisedRejectsReusedPIDWithoutKillingAnything(t *testing.T) {
+	created := time.Unix(100, 0).UTC()
+	processes := []core.Process{
+		{PID: 42, CreatedAt: created},
+		{PID: 43, ParentPID: 42, CreatedAt: created.Add(time.Second)},
+	}
+	native := &fakeNative{
+		jobPIDs: []uint32{42, 43},
+		createdByPID: map[uint32]time.Time{
+			42: created,
+			43: created.Add(time.Hour),
+		},
+	}
+	snapshotter := &fakeSnapshotter{processes: []ProcessDetails{
+		{Process: processes[0], MetadataAccessible: true},
+		{Process: processes[1], MetadataAccessible: true},
+	}}
+	supervisor := newSupervisor(&fakeResolver{}, native, snapshotter)
+	session := core.Session{
+		ID:         "session-a",
+		Confidence: core.ConfidenceSupervised,
+		JobName:    "TaskWatch-a",
+		Processes:  processes,
+	}
+	request := core.NewTerminationRequest(session.ID, processes).Confirm()
+
+	if err := supervisor.TerminateSupervised(request, session); err == nil {
+		t.Fatal("TerminateSupervised() accepted a PID reused during preflight")
+	}
+	if !reflect.DeepEqual(native.openedForTerminate, []uint32{42, 43}) {
+		t.Fatalf("preflight opens = %v, want every target checked before termination", native.openedForTerminate)
+	}
+	if len(native.terminatedPIDs) != 0 {
+		t.Fatalf("terminated PIDs = %v, want zero", native.terminatedPIDs)
+	}
+}
+
+func TestTerminateSupervisedRejectsMissingJobMemberWithoutKillingAnything(t *testing.T) {
+	created := time.Unix(100, 0).UTC()
+	processes := []core.Process{{PID: 42, CreatedAt: created}}
+	native := &fakeNative{jobPIDs: []uint32{42}}
+	supervisor := newSupervisor(&fakeResolver{}, native, &fakeSnapshotter{})
+	session := core.Session{
+		ID:         "session-a",
+		Confidence: core.ConfidenceSupervised,
+		JobName:    "TaskWatch-a",
+		Processes:  processes,
+	}
+	request := core.NewTerminationRequest(session.ID, processes).Confirm()
+
+	if err := supervisor.TerminateSupervised(request, session); err == nil {
+		t.Fatal("TerminateSupervised() accepted a job member missing from the process snapshot")
+	}
+	if len(native.openedForTerminate) != 0 || len(native.terminatedPIDs) != 0 {
+		t.Fatalf("opened/terminated = %v/%v, want zero", native.openedForTerminate, native.terminatedPIDs)
+	}
+}
+
+func TestTerminateSupervisedRejectsInaccessibleJobMemberWithoutKillingAnything(t *testing.T) {
+	created := time.Unix(100, 0).UTC()
+	processes := []core.Process{{PID: 42, CreatedAt: created}}
+	native := &fakeNative{jobPIDs: []uint32{42}}
+	snapshotter := &fakeSnapshotter{processes: []ProcessDetails{{
+		Process:            processes[0],
+		MetadataAccessible: false,
+		MetadataError:      "access denied",
+	}}}
+	supervisor := newSupervisor(&fakeResolver{}, native, snapshotter)
+	session := core.Session{
+		ID:         "session-a",
+		Confidence: core.ConfidenceSupervised,
+		JobName:    "TaskWatch-a",
+		Processes:  processes,
+	}
+	request := core.NewTerminationRequest(session.ID, processes).Confirm()
+
+	if err := supervisor.TerminateSupervised(request, session); err == nil {
+		t.Fatal("TerminateSupervised() accepted inaccessible job membership")
+	}
+	if len(native.openedForTerminate) != 0 || len(native.terminatedPIDs) != 0 {
+		t.Fatalf("opened/terminated = %v/%v, want zero", native.openedForTerminate, native.terminatedPIDs)
 	}
 }
 
