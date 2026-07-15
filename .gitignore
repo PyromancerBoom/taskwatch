@@ -35,3 +35,7 @@ go.work.sum
 .DS_Store
 Thumbs.db
 Desktop.ini
+
+# Sketchpad files
+PLAN.md
+docs/system-design.md
