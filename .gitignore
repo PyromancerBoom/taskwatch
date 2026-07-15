@@ -1,0 +1,37 @@
+# Repository-local Go toolchain state
+/.cache/
+
+# Build and release artifacts
+/bin/
+/dist/
+*.exe
+*.dll
+*.test
+*.out
+
+# Test and profiling output
+coverage.out
+coverage-*.out
+*.coverprofile
+*.prof
+
+# Local Go workspaces
+go.work
+go.work.sum
+
+# Local environment and diagnostic files
+.env
+.env.*
+!.env.example
+*.log
+/.superpowers/
+
+# Editors and operating systems
+/.idea/
+/.vscode/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+Desktop.ini

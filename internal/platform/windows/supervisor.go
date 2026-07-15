@@ -1,0 +1,316 @@
+package windows
+
+import (
+	"crypto/rand"
+	"encoding/hex"
+	"errors"
+	"fmt"
+	"os/exec"
+	"sort"
+	"sync"
+	"time"
+
+	"taskwatch/internal/core"
+)
+
+type nativeHandle uintptr
+
+type pathResolver interface {
+	LookPath(string) (string, error)
+}
+
+type execResolver struct{}
+
+func (execResolver) LookPath(name string) (string, error) { return exec.LookPath(name) }
+
+type nativeOperations interface {
+	createJob(name string) (nativeHandle, error)
+	openJob(name string) (nativeHandle, error)
+	createSuspended(executable, workspace string) (process, thread nativeHandle, pid uint32, err error)
+	assignProcess(job, process nativeHandle) error
+	resumeThread(thread nativeHandle) error
+	processCreatedAt(process nativeHandle) (time.Time, error)
+	terminateProcess(process nativeHandle) error
+	closeHandle(nativeHandle)
+	jobProcessIDs(job nativeHandle) ([]uint32, error)
+	terminateJob(job nativeHandle) error
+	openProcessForTerminate(pid uint32) (nativeHandle, error)
+	terminateOpenedProcess(process nativeHandle) error
+}
+
+// Supervisor owns live handles to TaskWatch-created jobs. Closing Supervisor
+// does not kill job members because TaskWatch never enables kill-on-close.
+type Supervisor struct {
+	resolver    pathResolver
+	native      nativeOperations
+	snapshotter Snapshotter
+
+	mu      sync.Mutex
+	handles map[string]nativeHandle
+}
+
+func NewSupervisor() *Supervisor {
+	return newSupervisor(execResolver{}, nativeWindows{}, NewProcessSnapshotter())
+}
+
+func newSupervisor(resolver pathResolver, native nativeOperations, snapshotter Snapshotter) *Supervisor {
+	return &Supervisor{
+		resolver:    resolver,
+		native:      native,
+		snapshotter: snapshotter,
+		handles:     make(map[string]nativeHandle),
+	}
+}
+
+func (supervisor *Supervisor) Launch(tool core.Tool, workspace string) (core.Session, error) {
+	command, err := commandForTool(tool)
+	if err != nil {
+		return core.Session{}, err
+	}
+	executable, err := supervisor.resolver.LookPath(command)
+	if err != nil {
+		return core.Session{}, fmt.Errorf("resolve %s from PATH: %w", command, err)
+	}
+
+	id, jobName, err := newSessionNames()
+	if err != nil {
+		return core.Session{}, err
+	}
+	job, err := supervisor.native.createJob(jobName)
+	if err != nil {
+		return core.Session{}, fmt.Errorf("create job object: %w", err)
+	}
+	keepJob := false
+	defer func() {
+		if !keepJob {
+			supervisor.native.closeHandle(job)
+		}
+	}()
+
+	process, thread, pid, err := supervisor.native.createSuspended(executable, workspace)
+	if err != nil {
+		return core.Session{}, fmt.Errorf("create suspended %s process: %w", command, err)
+	}
+	resumed := false
+	defer func() {
+		if !resumed {
+			_ = supervisor.native.terminateProcess(process)
+		}
+		supervisor.native.closeHandle(thread)
+		supervisor.native.closeHandle(process)
+	}()
+
+	createdAt, err := supervisor.native.processCreatedAt(process)
+	if err != nil {
+		return core.Session{}, fmt.Errorf("read root process creation time: %w", err)
+	}
+	if err := supervisor.native.assignProcess(job, process); err != nil {
+		return core.Session{}, fmt.Errorf("assign suspended process to job: %w", err)
+	}
+	if err := supervisor.native.resumeThread(thread); err != nil {
+		return core.Session{}, fmt.Errorf("resume supervised process: %w", err)
+	}
+	resumed = true
+	keepJob = true
+
+	supervisor.mu.Lock()
+	supervisor.handles[jobName] = job
+	supervisor.mu.Unlock()
+
+	root := core.Process{PID: pid, Name: command, CreatedAt: createdAt}
+	return core.Session{
+		ID:         id,
+		Tool:       tool,
+		Confidence: core.ConfidenceSupervised,
+		JobName:    jobName,
+		Workspace:  workspace,
+		Root:       root.Identity(),
+		StartedAt:  createdAt,
+		Processes:  []core.Process{root},
+		State:      core.StateRunning,
+	}, nil
+}
+
+func commandForTool(tool core.Tool) (string, error) {
+	switch tool {
+	case core.ToolClaudeCLI:
+		return "claude", nil
+	case core.ToolCodexCLI:
+		return "codex", nil
+	default:
+		return "", fmt.Errorf("tool %q cannot be supervised", tool)
+	}
+}
+
+func newSessionNames() (string, string, error) {
+	var random [16]byte
+	if _, err := rand.Read(random[:]); err != nil {
+		return "", "", fmt.Errorf("generate session ID: %w", err)
+	}
+	id := hex.EncodeToString(random[:])
+	return id, `Local\TaskWatch-` + id, nil
+}
+
+// Recover reopens a persisted named job and refreshes its current membership.
+func (supervisor *Supervisor) Recover(metadata core.Session) (core.Session, error) {
+	if metadata.JobName == "" || metadata.Confidence != core.ConfidenceSupervised {
+		return core.Session{}, errors.New("invalid supervised session metadata")
+	}
+	if _, err := supervisor.jobHandle(metadata.JobName); err != nil {
+		return core.Session{}, fmt.Errorf("open job %q: %w", metadata.JobName, err)
+	}
+	return supervisor.Refresh(metadata)
+}
+
+// Refresh queries live job membership and joins it to a best-effort process
+// snapshot. Missing process metadata makes the session inaccessible, not empty.
+func (supervisor *Supervisor) Refresh(session core.Session) (core.Session, error) {
+	job, err := supervisor.jobHandle(session.JobName)
+	if err != nil {
+		return session, err
+	}
+	pids, err := supervisor.native.jobProcessIDs(job)
+	if err != nil {
+		return session, fmt.Errorf("query job membership: %w", err)
+	}
+	snapshot, err := supervisor.snapshotter.Snapshot()
+	if err != nil {
+		return session, fmt.Errorf("snapshot processes: %w", err)
+	}
+	wanted := make(map[uint32]struct{}, len(pids))
+	for _, pid := range pids {
+		wanted[pid] = struct{}{}
+	}
+	processes := make([]core.Process, 0, len(pids))
+	inaccessible := false
+	for _, detail := range snapshot {
+		if _, exists := wanted[detail.Process.PID]; exists {
+			processes = append(processes, detail.Process)
+			if !detail.MetadataAccessible || detail.MetadataError != "" || detail.Process.CreatedAt.IsZero() {
+				inaccessible = true
+			}
+		}
+	}
+	sort.Slice(processes, func(i, j int) bool { return processes[i].PID < processes[j].PID })
+	inaccessible = inaccessible || len(processes) != len(wanted)
+	session.Processes = processes
+	session.State = core.DeriveState(session.Root, processes, inaccessible)
+	session.Resources = core.AggregateResources(processes)
+	return session, nil
+}
+
+func (supervisor *Supervisor) jobHandle(name string) (nativeHandle, error) {
+	supervisor.mu.Lock()
+	defer supervisor.mu.Unlock()
+	if handle, exists := supervisor.handles[name]; exists {
+		return handle, nil
+	}
+	handle, err := supervisor.native.openJob(name)
+	if err != nil {
+		return 0, err
+	}
+	supervisor.handles[name] = handle
+	return handle, nil
+}
+
+// TerminateSupervised force-terminates a named job only after explicit
+// confirmation. Job membership is the authoritative supervised boundary.
+func (supervisor *Supervisor) TerminateSupervised(request core.TerminationRequest, session core.Session) error {
+	if !request.Confirmed() {
+		return errors.New("termination request is not confirmed")
+	}
+	if len(request.Targets()) == 0 {
+		return errors.New("termination request has no targets")
+	}
+	if request.SessionID() == "" || request.SessionID() != session.ID {
+		return errors.New("termination request does not belong to session")
+	}
+	if session.Confidence != core.ConfidenceSupervised || session.JobName == "" {
+		return errors.New("invalid supervised session")
+	}
+	if err := core.RevalidateObserved(request, session.Processes); err != nil {
+		return fmt.Errorf("validate supervised session targets: %w", err)
+	}
+	job, err := supervisor.jobHandle(session.JobName)
+	if err != nil {
+		return fmt.Errorf("open job for termination: %w", err)
+	}
+	if err := supervisor.native.terminateJob(job); err != nil {
+		return fmt.Errorf("terminate job: %w", err)
+	}
+	return nil
+}
+
+// TerminateObserved re-snapshots the tree, checks exact PID+creation identity,
+// pre-opens every target, then terminates leaf-first. A failed preflight kills
+// nothing.
+func (supervisor *Supervisor) TerminateObserved(request core.TerminationRequest) error {
+	if !request.Confirmed() {
+		return errors.New("termination request is not confirmed")
+	}
+	targets := request.Targets()
+	if len(targets) == 0 {
+		return errors.New("termination request has no targets")
+	}
+	snapshot, err := supervisor.snapshotter.Snapshot()
+	if err != nil {
+		return fmt.Errorf("snapshot observed tree: %w", err)
+	}
+	allProcesses := detailsProcesses(snapshot)
+	var current []core.Process
+	var validationErr error
+	for _, possibleRoot := range targets {
+		candidate := core.CollectTree(allProcesses, possibleRoot)
+		validationErr = core.RevalidateObserved(request, candidate)
+		if validationErr == nil {
+			current = candidate
+			break
+		}
+	}
+	if validationErr != nil {
+		return fmt.Errorf("revalidate observed tree: %w", validationErr)
+	}
+
+	handles := make([]nativeHandle, 0, len(current))
+	for _, process := range current {
+		handle, openErr := supervisor.native.openProcessForTerminate(process.PID)
+		if openErr != nil {
+			for _, opened := range handles {
+				supervisor.native.closeHandle(opened)
+			}
+			return fmt.Errorf("preflight PID %d: %w", process.PID, openErr)
+		}
+		handles = append(handles, handle)
+		createdAt, identityErr := supervisor.native.processCreatedAt(handle)
+		if identityErr != nil || !core.SameProcess(process.Identity(), core.ProcessIdentity{PID: process.PID, CreatedAt: createdAt}) {
+			for _, opened := range handles {
+				supervisor.native.closeHandle(opened)
+			}
+			if identityErr != nil {
+				return fmt.Errorf("preflight identity for PID %d: %w", process.PID, identityErr)
+			}
+			return fmt.Errorf("preflight identity for PID %d changed", process.PID)
+		}
+	}
+	defer func() {
+		for _, handle := range handles {
+			supervisor.native.closeHandle(handle)
+		}
+	}()
+	for i := len(handles) - 1; i >= 0; i-- {
+		if err := supervisor.native.terminateOpenedProcess(handles[i]); err != nil {
+			return fmt.Errorf("terminate observed PID %d: %w", current[i].PID, err)
+		}
+	}
+	return nil
+}
+
+// Close releases TaskWatch's job handles without terminating their processes.
+func (supervisor *Supervisor) Close() {
+	supervisor.mu.Lock()
+	defer supervisor.mu.Unlock()
+	for name, handle := range supervisor.handles {
+		supervisor.native.closeHandle(handle)
+		delete(supervisor.handles, name)
+	}
+}
