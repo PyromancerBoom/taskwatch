@@ -38,12 +38,14 @@ type ProcessIdentity struct {
 
 // Process is a point-in-time process snapshot.
 type Process struct {
-	PID         uint32
-	ParentPID   uint32
-	Name        string
-	CreatedAt   time.Time
-	CPUPercent  float64
-	MemoryBytes uint64
+	PID             uint32
+	ParentPID       uint32
+	Name            string
+	CreatedAt       time.Time
+	CPUPercent      float64
+	MemoryBytes     uint64
+	CPUAvailable    bool
+	MemoryAvailable bool
 }
 
 func (p Process) Identity() ProcessIdentity {
@@ -52,8 +54,10 @@ func (p Process) Identity() ProcessIdentity {
 
 // ResourceUsage is the aggregate resource use of a process collection.
 type ResourceUsage struct {
-	CPUPercent  float64
-	MemoryBytes uint64
+	CPUPercent      float64
+	MemoryBytes     uint64
+	CPUAvailable    bool
+	MemoryAvailable bool
 }
 
 // Session is the in-memory representation of a tracked tool session.
@@ -88,10 +92,12 @@ func DeriveState(root ProcessIdentity, processes []Process, inaccessible bool) S
 
 // AggregateResources sums the resource use of all supplied processes.
 func AggregateResources(processes []Process) ResourceUsage {
-	var total ResourceUsage
+	total := ResourceUsage{CPUAvailable: len(processes) > 0, MemoryAvailable: len(processes) > 0}
 	for _, process := range processes {
 		total.CPUPercent += process.CPUPercent
 		total.MemoryBytes += process.MemoryBytes
+		total.CPUAvailable = total.CPUAvailable && process.CPUAvailable
+		total.MemoryAvailable = total.MemoryAvailable && process.MemoryAvailable
 	}
 	return total
 }

@@ -97,7 +97,7 @@ func (snapshotter *ProcessSnapshotter) detailsForEntry(entry winapi.ProcessEntry
 		ticks := filetimeTicks(kernel) + filetimeTicks(user)
 		if cpu, available := snapshotter.cpuPercent(entry.ProcessID, detail.Process.CreatedAt, now, ticks); available {
 			detail.Process.CPUPercent = cpu
-			detail.CPUAvailable = true
+			detail.Process.CPUAvailable = true
 		}
 	} else {
 		detail.MetadataError = appendMetadataError(detail.MetadataError, "times", err)
@@ -117,7 +117,7 @@ func (snapshotter *ProcessSnapshotter) detailsForEntry(entry winapi.ProcessEntry
 	}
 	if workingSet, err := queryWorkingSet(process); err == nil {
 		detail.Process.MemoryBytes = uint64(workingSet)
-		detail.MemoryAvailable = true
+		detail.Process.MemoryAvailable = true
 	} else {
 		detail.MetadataError = appendMetadataError(detail.MetadataError, "memory", err)
 	}

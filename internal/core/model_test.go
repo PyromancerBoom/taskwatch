@@ -32,8 +32,8 @@ func TestDeriveState(t *testing.T) {
 
 func TestAggregateResources(t *testing.T) {
 	processes := []Process{
-		{CPUPercent: 3.5, MemoryBytes: 1024},
-		{CPUPercent: 1.25, MemoryBytes: 2048},
+		{CPUPercent: 3.5, MemoryBytes: 1024, CPUAvailable: true, MemoryAvailable: true},
+		{CPUPercent: 1.25, MemoryBytes: 2048, CPUAvailable: true, MemoryAvailable: true},
 	}
 
 	got := AggregateResources(processes)
@@ -43,6 +43,42 @@ func TestAggregateResources(t *testing.T) {
 	if got.MemoryBytes != 3072 {
 		t.Fatalf("MemoryBytes = %d, want 3072", got.MemoryBytes)
 	}
+	if !got.CPUAvailable || !got.MemoryAvailable {
+		t.Fatalf("availability = CPU %t, memory %t; want both available", got.CPUAvailable, got.MemoryAvailable)
+	}
+}
+
+func TestAggregateResourcesEmptySetIsUnavailable(t *testing.T) {
+	got := AggregateResources(nil)
+	if got.CPUAvailable || got.MemoryAvailable {
+		t.Fatalf("availability = CPU %t, memory %t; want both unavailable", got.CPUAvailable, got.MemoryAvailable)
+	}
+}
+
+func TestAggregateResourcesRequiresEveryProcessMetric(t *testing.T) {
+	t.Run("partially unavailable memory", func(t *testing.T) {
+		got := AggregateResources([]Process{
+			{CPUPercent: 1, MemoryBytes: 100, CPUAvailable: true, MemoryAvailable: true},
+			{CPUPercent: 2, MemoryBytes: 200, CPUAvailable: true, MemoryAvailable: false},
+		})
+		if !got.CPUAvailable || got.MemoryAvailable {
+			t.Fatalf("availability = CPU %t, memory %t; want CPU available and memory unavailable", got.CPUAvailable, got.MemoryAvailable)
+		}
+		if got.CPUPercent != 3 || got.MemoryBytes != 300 {
+			t.Fatalf("numeric totals = CPU %v, memory %d; want 3 and 300", got.CPUPercent, got.MemoryBytes)
+		}
+	})
+
+	t.Run("first CPU sample unavailable", func(t *testing.T) {
+		got := AggregateResources([]Process{{
+			MemoryBytes:     100,
+			CPUAvailable:    false,
+			MemoryAvailable: true,
+		}})
+		if got.CPUAvailable || !got.MemoryAvailable {
+			t.Fatalf("availability = CPU %t, memory %t; want CPU unavailable and memory available", got.CPUAvailable, got.MemoryAvailable)
+		}
+	})
 }
 
 func TestSameProcessRejectsReusedPID(t *testing.T) {

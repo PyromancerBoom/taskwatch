@@ -8,6 +8,7 @@ import (
 	"os/exec"
 	"sort"
 	"sync"
+	"syscall"
 	"time"
 
 	"taskwatch/internal/core"
@@ -152,30 +153,104 @@ func newSessionNames() (string, string, error) {
 
 // Recover reopens a persisted named job and refreshes its current membership.
 func (supervisor *Supervisor) Recover(metadata core.Session) (core.Session, error) {
-	if metadata.JobName == "" || metadata.Confidence != core.ConfidenceSupervised {
-		return core.Session{}, errors.New("invalid supervised session metadata")
+	results, errs := supervisor.RecoverMany([]core.Session{metadata})
+	return results[0], errs[0]
+}
+
+// RecoverMany reopens valid persisted named jobs and refreshes all successfully
+// opened jobs together.
+func (supervisor *Supervisor) RecoverMany(metadata []core.Session) ([]core.Session, []error) {
+	results := make([]core.Session, len(metadata))
+	errs := make([]error, len(metadata))
+	opened := make([]core.Session, 0, len(metadata))
+	indices := make([]int, 0, len(metadata))
+	for i := range metadata {
+		if metadata[i].JobName == "" || metadata[i].Confidence != core.ConfidenceSupervised {
+			errs[i] = errors.New("invalid supervised session metadata")
+			continue
+		}
+		if _, err := supervisor.jobHandle(metadata[i].JobName); err != nil {
+			if errors.Is(err, syscall.ERROR_FILE_NOT_FOUND) {
+				exited := metadata[i]
+				exited.Processes = nil
+				exited.Resources = core.ResourceUsage{}
+				exited.State = core.StateExited
+				results[i] = exited
+				continue
+			}
+			errs[i] = fmt.Errorf("open job %q: %w", metadata[i].JobName, err)
+			continue
+		}
+		opened = append(opened, metadata[i])
+		indices = append(indices, i)
 	}
-	if _, err := supervisor.jobHandle(metadata.JobName); err != nil {
-		return core.Session{}, fmt.Errorf("open job %q: %w", metadata.JobName, err)
+	if len(opened) == 0 {
+		return results, errs
 	}
-	return supervisor.Refresh(metadata)
+	refreshed, refreshErrs := supervisor.RefreshMany(opened)
+	for i, index := range indices {
+		results[index] = refreshed[i]
+		errs[index] = refreshErrs[i]
+	}
+	return results, errs
 }
 
 // Refresh queries live job membership and joins it to a best-effort process
 // snapshot. Missing process metadata makes the session inaccessible, not empty.
 func (supervisor *Supervisor) Refresh(session core.Session) (core.Session, error) {
-	job, err := supervisor.jobHandle(session.JobName)
-	if err != nil {
-		return session, err
+	results, errs := supervisor.RefreshMany([]core.Session{session})
+	return results[0], errs[0]
+}
+
+type refreshCandidate struct {
+	index int
+	pids  []uint32
+}
+
+// RefreshMany refreshes each supplied session in input order. Job membership
+// is queried per session, while all successful queries share one snapshot.
+func (supervisor *Supervisor) RefreshMany(sessions []core.Session) ([]core.Session, []error) {
+	results := append([]core.Session(nil), sessions...)
+	errs := make([]error, len(sessions))
+	candidates := make([]refreshCandidate, 0, len(sessions))
+	for i := range sessions {
+		job, err := supervisor.jobHandle(sessions[i].JobName)
+		if err != nil {
+			if errors.Is(err, syscall.ERROR_FILE_NOT_FOUND) {
+				exited := sessions[i]
+				exited.Processes = nil
+				exited.Resources = core.ResourceUsage{}
+				exited.State = core.StateExited
+				results[i] = exited
+				continue
+			}
+			errs[i] = err
+			continue
+		}
+		pids, err := supervisor.native.jobProcessIDs(job)
+		if err != nil {
+			errs[i] = fmt.Errorf("query job membership: %w", err)
+			continue
+		}
+		candidates = append(candidates, refreshCandidate{index: i, pids: pids})
 	}
-	pids, err := supervisor.native.jobProcessIDs(job)
-	if err != nil {
-		return session, fmt.Errorf("query job membership: %w", err)
+	if len(candidates) == 0 {
+		return results, errs
 	}
 	snapshot, err := supervisor.snapshotter.Snapshot()
 	if err != nil {
-		return session, fmt.Errorf("snapshot processes: %w", err)
+		for _, candidate := range candidates {
+			errs[candidate.index] = fmt.Errorf("snapshot processes: %w", err)
+		}
+		return results, errs
 	}
+	for _, candidate := range candidates {
+		results[candidate.index] = refreshSession(sessions[candidate.index], candidate.pids, snapshot)
+	}
+	return results, errs
+}
+
+func refreshSession(session core.Session, pids []uint32, snapshot []ProcessDetails) core.Session {
 	wanted := make(map[uint32]struct{}, len(pids))
 	for _, pid := range pids {
 		wanted[pid] = struct{}{}
@@ -195,7 +270,7 @@ func (supervisor *Supervisor) Refresh(session core.Session) (core.Session, error
 	session.Processes = processes
 	session.State = core.DeriveState(session.Root, processes, inaccessible)
 	session.Resources = core.AggregateResources(processes)
-	return session, nil
+	return session
 }
 
 func (supervisor *Supervisor) jobHandle(name string) (nativeHandle, error) {

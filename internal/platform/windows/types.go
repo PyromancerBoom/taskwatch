@@ -12,8 +12,6 @@ type ProcessDetails struct {
 	CommandLine        string
 	MetadataAccessible bool
 	MetadataError      string
-	CPUAvailable       bool
-	MemoryAvailable    bool
 }
 
 func detailsProcesses(details []ProcessDetails) []core.Process {
