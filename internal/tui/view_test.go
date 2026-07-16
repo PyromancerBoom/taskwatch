@@ -157,7 +157,7 @@ func TestLabelsSelectionWarningSummaryAndRefreshingMarker(t *testing.T) {
 	model.snapshot.Warnings = []app.Warning{{Message: "first warning"}, {Message: "second warning"}, {Message: "third warning"}}
 	content := model.View().Content
 
-	for _, want := range []string{"Claude", "Codex CLI", "Codex Desktop", "found", "running", "exited", "leftovers", "inaccessible", "stale", "▌", "first warning +2 more", "Refreshing…"} {
+	for _, want := range []string{"Claude", "Codex CLI", "Codex Desktop", "observed", "running", "exited", "leftovers", "inaccessible", "stale", "▌", "first warning +2 more", "Refreshing…"} {
 		if !strings.Contains(content, want) {
 			t.Errorf("view missing %q:\n%s", want, content)
 		}

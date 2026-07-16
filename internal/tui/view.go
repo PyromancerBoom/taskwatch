@@ -11,6 +11,12 @@ import (
 	"taskwatch/internal/core"
 )
 
+// brand is the application wordmark shown in the header. It stays contiguous
+// with the workspace and status that follow it so the header reads as one line.
+const brand = "TASKWATCH"
+
+const footerHint = "↑/↓ or j/k move  •  r refresh  •  Ctrl+C close (apps keep running)"
+
 type palette struct {
 	dark    bool
 	text    lipgloss.Style
@@ -59,8 +65,9 @@ func (m Model) render() string {
 	if width < 1 {
 		width = 80
 	}
+	title := m.palette.focus
 	if m.startupErr != nil {
-		lines := renderWrapped(m.palette.focus, "TASKWATCH", width)
+		lines := renderWrapped(title, brand, width)
 		lines = append(lines, "")
 		lines = append(lines, renderWrapped(m.palette.failure, "Unable to start TaskWatch", width)...)
 		lines = append(lines, renderWrapped(m.palette.failure, m.startupErr.Error(), width)...)
@@ -70,7 +77,7 @@ func (m Model) render() string {
 	}
 	if !m.started {
 		return strings.Join([]string{
-			m.palette.focus.Render(clip("TASKWATCH", width)),
+			title.Render(clip(brand, width)),
 			"",
 			m.palette.muted.Render(clip("Starting TaskWatch…", width)),
 		}, "\n")
@@ -80,8 +87,9 @@ func (m Model) render() string {
 	if m.refreshing {
 		status = "Refreshing…"
 	}
-	header := fmt.Sprintf("TASKWATCH  %s  %s", m.snapshot.Workspace, status)
-	lines := renderWrapped(m.palette.focus, header, width)
+	header := fmt.Sprintf("%s  %s  %s", brand, m.snapshot.Workspace, status)
+	lines := renderWrapped(title, header, width)
+	lines = append(lines, m.summaryLines(width)...)
 	lines = append(lines, "")
 
 	if len(m.snapshot.Warnings) > 0 {
@@ -100,12 +108,12 @@ func (m Model) render() string {
 	} else {
 		switch {
 		case width >= 110:
-			lines = append(lines, m.palette.muted.Render(clip(fullHeading(), width)))
+			lines = append(lines, m.palette.muted.Render(clip("  "+fullHeading(), width)))
 			for _, session := range m.snapshot.Sessions {
 				lines = append(lines, m.renderRow(session, fullRow(session, m.now()), width))
 			}
 		case width >= 80:
-			lines = append(lines, m.palette.muted.Render(clip(mediumHeading(), width)))
+			lines = append(lines, m.palette.muted.Render(clip("  "+mediumHeading(), width)))
 			for _, session := range m.snapshot.Sessions {
 				lines = append(lines, m.renderRow(session, mediumRow(session, m.now()), width))
 				lines = append(lines, m.palette.muted.Render(clip("    "+folder(session), width)))
@@ -120,7 +128,7 @@ func (m Model) render() string {
 	}
 
 	lines = append(lines, "")
-	lines = append(lines, renderWrapped(m.palette.muted, "↑/↓ or j/k move  •  r refresh  •  Ctrl+C close (apps keep running)", width)...)
+	lines = append(lines, renderWrapped(m.palette.muted, footerHint, width)...)
 	return strings.Join(lines, "\n")
 }
 
@@ -162,23 +170,23 @@ func wrapDisplayWidth(value string, width int) []string {
 }
 
 func fullHeading() string {
-	return fmt.Sprintf("  %-13s %-8s %-12s %-9s %-11s %-10s %-5s %s", "APP", "TRACKING", "STATUS", "PROCESSES", "CPU", "MEMORY", "AGE", "FOLDER")
+	return fmt.Sprintf("  %-13s %-8s %-12s %-9s %-12s %-10s %-5s %s", "APP", "TRACKING", "STATUS", "PROCESSES", "CPU", "WS MEMORY", "AGE", "FOLDER")
 }
 
 func fullRow(session core.Session, now time.Time) string {
-	return fmt.Sprintf("  %-13s %-8s %-12s %-9d %-11s %-10s %-5s %s",
+	return fmt.Sprintf("  %-13s %-8s %-12s %-9d %-12s %-10s %-5s %s",
 		toolLabel(session.Tool), trackingLabel(session.Confidence), string(session.State), len(session.Processes),
-		cpuLabel(session), memoryLabel(session.Resources), ageLabel(session.StartedAt, now), folder(session))
+		cpuCell(session), memoryLabel(session.Resources), ageLabel(session.StartedAt, now), folder(session))
 }
 
 func mediumHeading() string {
-	return fmt.Sprintf("  %-13s %-8s %-12s %-4s %-10s %-9s %-4s", "APP", "TRACKING", "STATUS", "PROC", "CPU", "MEMORY", "AGE")
+	return fmt.Sprintf("  %-13s %-8s %-12s %-4s %-12s %-9s %-4s", "APP", "TRACKING", "STATUS", "PROC", "CPU", "WS MEMORY", "AGE")
 }
 
 func mediumRow(session core.Session, now time.Time) string {
-	return fmt.Sprintf("  %-13s %-8s %-12s %-4d %-10s %-9s %-4s",
+	return fmt.Sprintf("  %-13s %-8s %-12s %-4d %-12s %-9s %-4s",
 		toolLabel(session.Tool), trackingLabel(session.Confidence), string(session.State), len(session.Processes),
-		cpuLabel(session), memoryLabel(session.Resources), ageLabel(session.StartedAt, now))
+		cpuCell(session), memoryLabel(session.Resources), ageLabel(session.StartedAt, now))
 }
 
 func narrowRows(session core.Session, now time.Time) (string, string) {
@@ -188,26 +196,174 @@ func narrowRows(session core.Session, now time.Time) (string, string) {
 	return first, second
 }
 
+// renderRow draws one session line: a selection marker, a status dot colored by
+// lifecycle state, then the row content. The dot carries the state color for
+// every row while healthy row text stays in the default foreground, so color
+// still signals attention rather than painting the whole table.
 func (m Model) renderRow(session core.Session, line string, width int) string {
 	line = clip(line, width)
-	marker := "  "
-	if session.ID == m.selectedID {
-		marker = m.palette.focus.Render("▌") + " "
-	}
 	if strings.HasPrefix(line, "  ") {
 		line = strings.TrimPrefix(line, "  ")
 	}
-	available := width - 2
-	if available < 0 {
-		available = 0
+	style := m.stateStyle(session.State)
+	if width < 8 {
+		return style.Render(clip(line, width))
 	}
-	return marker + m.stateStyle(session.State).Render(clip(line, available))
+	available := width - 4
+	content := clip(line, available)
+	dot := m.dotStyle(session.State).Render("●") + " "
+
+	if session.ID == m.selectedID {
+		return m.palette.focus.Render("▌") + " " + dot + style.Bold(true).Render(content)
+	}
+	return "  " + dot + style.Render(content)
 }
 
-func (m Model) stateStyle(state core.State) lipgloss.Style {
+// dotStyle colors the per-row status dot for every lifecycle state, including
+// the healthy and exited ones that keep default or muted row text.
+func (m Model) dotStyle(state core.State) lipgloss.Style {
 	switch state {
 	case core.StateRunning:
 		return m.palette.healthy
+	case core.StateStale, core.StateLeftovers:
+		return m.palette.warning
+	case core.StateInaccessible:
+		return m.palette.failure
+	default:
+		return m.palette.muted
+	}
+}
+
+// summaryLines renders a one-line overview strip: session count, per-state
+// counts with colored dots, aggregate CPU and memory, and a CPU sparkline.
+// The colored version is only emitted when the plain text fits the width;
+// otherwise a muted clipped fallback is used because clip is not ANSI-safe.
+func (m Model) summaryLines(width int) []string {
+	sessions := m.snapshot.Sessions
+	if len(sessions) == 0 {
+		return nil
+	}
+
+	type piece struct{ plain, styled string }
+	countLabel := fmt.Sprintf("%d sessions", len(sessions))
+	if len(sessions) == 1 {
+		countLabel = "1 session"
+	}
+	pieces := []piece{{countLabel, m.palette.text.Render(countLabel)}}
+
+	counts := make(map[core.State]int, len(sessions))
+	for _, session := range sessions {
+		counts[session.State]++
+	}
+	for _, state := range []core.State{core.StateRunning, core.StateStale, core.StateLeftovers, core.StateInaccessible, core.StateExited} {
+		if n := counts[state]; n > 0 {
+			text := fmt.Sprintf("● %d %s", n, string(state))
+			pieces = append(pieces, piece{text, m.dotStyle(state).Render(text)})
+		}
+	}
+
+	cpuTotal, cpuSampled := 0.0, false
+	var memTotal core.ResourceUsage
+	for _, session := range sessions {
+		if session.Resources.CPUAvailable {
+			cpuTotal += session.Resources.CPUPercent
+			cpuSampled = true
+		}
+		if session.Resources.MemoryAvailable {
+			memTotal.MemoryBytes += session.Resources.MemoryBytes
+			memTotal.MemoryAvailable = true
+		}
+	}
+	var totals []string
+	if cpuSampled {
+		totals = append(totals, fmt.Sprintf("CPU %.1f%%", cpuTotal))
+	}
+	if memTotal.MemoryAvailable {
+		totals = append(totals, "MEM "+memoryLabel(memTotal))
+	}
+	if len(totals) > 0 {
+		text := strings.Join(totals, " · ")
+		pieces = append(pieces, piece{text, m.palette.muted.Render(text)})
+	}
+	if spark := sparkline(m.cpuHistory); spark != "" {
+		pieces = append(pieces, piece{spark, m.palette.focus.Render(spark)})
+	}
+
+	const separator = "   "
+	plainParts := make([]string, len(pieces))
+	styledParts := make([]string, len(pieces))
+	for i, p := range pieces {
+		plainParts[i] = p.plain
+		styledParts[i] = p.styled
+	}
+	plain := strings.Join(plainParts, separator)
+	if lipgloss.Width(plain) <= width {
+		return []string{strings.Join(styledParts, separator)}
+	}
+	return []string{m.palette.muted.Render(clip(plain, width))}
+}
+
+// cpuGauge draws a five-cell usage bar for a CPU percentage. Any non-zero
+// usage lights at least one cell so activity is never rendered as idle.
+func cpuGauge(percent float64) string {
+	const cells = 5
+	if percent < 0 {
+		percent = 0
+	}
+	if percent > 100 {
+		percent = 100
+	}
+	filled := int(percent/100*cells + 0.5)
+	if percent > 0 && filled == 0 {
+		filled = 1
+	}
+	return strings.Repeat("▰", filled) + strings.Repeat("▱", cells-filled)
+}
+
+// cpuCell pairs the CPU gauge with the numeric label when a sample exists;
+// unavailable and sampling placeholders pass through unchanged.
+func cpuCell(session core.Session) string {
+	if session.Resources.CPUAvailable {
+		return cpuGauge(session.Resources.CPUPercent) + " " + cpuLabel(session)
+	}
+	return cpuLabel(session)
+}
+
+// sparkline maps the CPU history onto block glyphs, normalized to the highest
+// sample. It stays hidden until there are at least two samples to compare.
+func sparkline(values []float64) string {
+	if len(values) < 2 {
+		return ""
+	}
+	glyphs := []rune("▁▂▃▄▅▆▇█")
+	max := 0.0
+	for _, value := range values {
+		if value > max {
+			max = value
+		}
+	}
+	if max <= 0 {
+		max = 1
+	}
+	var line strings.Builder
+	for _, value := range values {
+		if value < 0 {
+			value = 0
+		}
+		index := int(value / max * float64(len(glyphs)-1))
+		if index >= len(glyphs) {
+			index = len(glyphs) - 1
+		}
+		line.WriteRune(glyphs[index])
+	}
+	return line.String()
+}
+
+// stateStyle keeps healthy sessions in the default foreground and reserves color
+// for states that warrant attention, so anomalies stand out instead of a wall
+// of color.
+func (m Model) stateStyle(state core.State) lipgloss.Style {
+	switch state {
 	case core.StateStale, core.StateLeftovers:
 		return m.palette.warning
 	case core.StateInaccessible, core.StateExited:
@@ -235,7 +391,7 @@ func trackingLabel(confidence core.Confidence) string {
 	case core.ConfidenceSupervised:
 		return "managed"
 	case core.ConfidenceObserved:
-		return "found"
+		return "observed"
 	default:
 		return string(confidence)
 	}

@@ -44,6 +44,7 @@ type Model struct {
 	generation uint64
 	width      int
 	palette    palette
+	cpuHistory []float64
 }
 
 func NewModel(coordinator Coordinator, interval time.Duration) Model {
@@ -86,6 +87,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.started = true
 		m.startupErr = nil
 		m.reconcileSelection()
+		m.recordCPU()
 		return m.scheduleTick()
 	case tickMsg:
 		if !m.started || m.startupErr != nil || m.refreshing || msg.generation != m.generation {
@@ -96,6 +98,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.snapshot = msg.snapshot
 		m.refreshing = false
 		m.reconcileSelection()
+		m.recordCPU()
 		return m.scheduleTick()
 	case tea.KeyPressMsg:
 		if msg.String() == "ctrl+c" {
@@ -134,6 +137,28 @@ func (m Model) startRefresh() (tea.Model, tea.Cmd) {
 	m.refreshing = true
 	return m, func() tea.Msg {
 		return refreshMsg{snapshot: m.coordinator.Refresh()}
+	}
+}
+
+// recordCPU appends the total CPU usage across sessions to the sparkline
+// history. Nothing is recorded until at least one session reports a sample, so
+// the sparkline does not start with a meaningless flat zero.
+func (m *Model) recordCPU() {
+	total := 0.0
+	sampled := false
+	for _, session := range m.snapshot.Sessions {
+		if session.Resources.CPUAvailable {
+			total += session.Resources.CPUPercent
+			sampled = true
+		}
+	}
+	if !sampled && len(m.cpuHistory) == 0 {
+		return
+	}
+	const maxSamples = 16
+	m.cpuHistory = append(m.cpuHistory, total)
+	if len(m.cpuHistory) > maxSamples {
+		m.cpuHistory = m.cpuHistory[len(m.cpuHistory)-maxSamples:]
 	}
 }
 
