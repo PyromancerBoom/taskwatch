@@ -2,8 +2,10 @@ package tui
 
 import (
 	"errors"
+	"fmt"
 	"image/color"
 	"reflect"
+	"strings"
 	"testing"
 	"time"
 
@@ -231,6 +233,177 @@ func TestSelectionMovesWithoutWrapping(t *testing.T) {
 	}
 }
 
+func TestWindowSizeMsgSetsWidthAndHeight(t *testing.T) {
+	model := NewModel(&stubCoordinator{}, time.Second)
+
+	model, cmd := update(t, model, tea.WindowSizeMsg{Width: 100, Height: 30})
+
+	if cmd != nil {
+		t.Fatalf("WindowSizeMsg returned command %v, want nil", cmd)
+	}
+	if model.width != 100 || model.height != 30 {
+		t.Fatalf("size = %dx%d, want 100x30", model.width, model.height)
+	}
+}
+
+func TestWindowResizeKeepsSelectionVisibleAcrossRowModes(t *testing.T) {
+	tests := []struct {
+		name          string
+		width, height int
+	}{
+		{name: "medium rows", width: 90, height: 8},
+		{name: "narrow rows", width: 40, height: 8},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			model := NewModel(&stubCoordinator{}, time.Second)
+			model.started = true
+			model.width = 130
+			model.height = 10
+			model.snapshot.Sessions = manySessions(12)
+			model.selectedID = "s00"
+
+			for i := 0; i < len(model.snapshot.Sessions); i++ {
+				model, _ = update(t, model, key("down"))
+			}
+			if model.selectedID != "s11" {
+				t.Fatalf("precondition: selected = %q, want s11", model.selectedID)
+			}
+
+			model, _ = update(t, model, tea.WindowSizeMsg{Width: tc.width, Height: tc.height})
+			if !strings.Contains(model.View().Content, "▌") {
+				t.Fatalf("selected row disappeared after resize to %dx%d; offset=%d:\n%s", tc.width, tc.height, model.scrollOffset, model.View().Content)
+			}
+		})
+	}
+}
+
+func manySessions(n int) []core.Session {
+	sessions := make([]core.Session, n)
+	for i := range sessions {
+		sessions[i] = session(fmt.Sprintf("s%02d", i))
+	}
+	return sessions
+}
+
+func TestRecordCPUDistinguishesMissingSampleFromRealZero(t *testing.T) {
+	tests := []struct {
+		name      string
+		resources core.ResourceUsage
+		want      []float64
+	}{
+		{name: "missing sample is skipped", want: []float64{12.3}},
+		{name: "sampled zero is recorded", resources: core.ResourceUsage{CPUAvailable: true}, want: []float64{12.3, 0}},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			model := NewModel(&stubCoordinator{}, time.Second)
+			model.cpuHistory = []float64{12.3}
+			model.snapshot.Sessions = []core.Session{{Resources: tc.resources}}
+
+			model.recordCPU()
+
+			if !reflect.DeepEqual(model.cpuHistory, tc.want) {
+				t.Fatalf("cpuHistory = %v, want %v", model.cpuHistory, tc.want)
+			}
+		})
+	}
+}
+
+func TestPageDownAndPageUpMoveByViewportWithoutWrapping(t *testing.T) {
+	model := NewModel(&stubCoordinator{}, time.Second)
+	model.started = true
+	model.width = 130
+	model.height = 10
+	model.snapshot.Sessions = manySessions(12)
+	model.selectedID = "s00"
+
+	model, _ = update(t, model, key("pgdown"))
+	afterFirstPage := model.selectedID
+	if afterFirstPage == "s00" {
+		t.Fatal("pgdn did not move selection")
+	}
+
+	for i := 0; i < 20; i++ {
+		model, _ = update(t, model, key("pgdown"))
+	}
+	if model.selectedID != "s11" {
+		t.Fatalf("pgdn clamp: selected = %q, want s11 (last session, no wrap)", model.selectedID)
+	}
+
+	for i := 0; i < 20; i++ {
+		model, _ = update(t, model, key("pgup"))
+	}
+	if model.selectedID != "s00" {
+		t.Fatalf("pgup clamp: selected = %q, want s00 (first session, no wrap)", model.selectedID)
+	}
+}
+
+func TestPageMovementUsesRenderedSessionCapacity(t *testing.T) {
+	for _, width := range []int{40, 90, 130} {
+		for _, direction := range []string{"pgdown", "pgup"} {
+			t.Run(fmt.Sprintf("width_%d_%s", width, direction), func(t *testing.T) {
+				model := NewModel(&stubCoordinator{}, time.Second)
+				model.started = true
+				model.width = width
+				model.height = 10
+				model.snapshot.Sessions = manySessions(12)
+
+				selectedIndex := 0
+				if direction == "pgup" {
+					selectedIndex = len(model.snapshot.Sessions) - 1
+				}
+				model.selectedID = model.snapshot.Sessions[selectedIndex].ID
+				model.ensureSelectionVisible()
+
+				plan := model.layoutPlanForViewport()
+				start, end, _, _ := sessionWindow(len(model.snapshot.Sessions), model.scrollOffset, plan.viewportLines, plan.rowsPerSession)
+				visible := end - start
+				if visible < 1 {
+					t.Fatalf("precondition: rendered session capacity = %d", visible)
+				}
+				wantIndex := selectedIndex + visible
+				if direction == "pgup" {
+					wantIndex = selectedIndex - visible
+				}
+
+				model, _ = update(t, model, key(direction))
+				if got, want := model.selectedID, model.snapshot.Sessions[wantIndex].ID; got != want {
+					t.Fatalf("%s moved selection to %q, want %q using rendered capacity %d", direction, got, want, visible)
+				}
+			})
+		}
+	}
+}
+
+func TestScrollOffsetReconciledWhenSessionListShrinks(t *testing.T) {
+	model := NewModel(&stubCoordinator{}, time.Second)
+	model.started = true
+	model.width = 130
+	model.height = 8
+	model.snapshot.Sessions = manySessions(12)
+	model.selectedID = "s00"
+	model.tick = fakeTick(new([]tickCall))
+
+	for i := 0; i < 20; i++ {
+		model, _ = update(t, model, key("pgdown"))
+	}
+	if model.scrollOffset == 0 {
+		t.Fatal("expected scroll offset to advance after paging down through many sessions")
+	}
+
+	model, _ = update(t, model, refreshMsg{snapshot: app.Snapshot{Sessions: manySessions(2)}})
+
+	if model.scrollOffset != 0 {
+		t.Fatalf("scrollOffset after shrink = %d, want 0 (only 2 sessions left)", model.scrollOffset)
+	}
+	if model.selectedID != "s00" {
+		t.Fatalf("selection after shrink = %q, want fallback to first remaining session", model.selectedID)
+	}
+}
+
 func TestRefreshPreservesSelectionByIDThenFallsBackAndClears(t *testing.T) {
 	model := NewModel(&stubCoordinator{}, time.Second)
 	model.started = true
@@ -285,6 +458,10 @@ func key(name string) tea.KeyPressMsg {
 		return tea.KeyPressMsg(tea.Key{Code: tea.KeyUp})
 	case "down":
 		return tea.KeyPressMsg(tea.Key{Code: tea.KeyDown})
+	case "pgup":
+		return tea.KeyPressMsg(tea.Key{Code: tea.KeyPgUp})
+	case "pgdown":
+		return tea.KeyPressMsg(tea.Key{Code: tea.KeyPgDown})
 	case "ctrl+c":
 		return tea.KeyPressMsg(tea.Key{Code: 'c', Mod: tea.ModCtrl})
 	default:

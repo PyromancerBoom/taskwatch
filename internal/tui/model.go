@@ -36,15 +36,17 @@ type Model struct {
 	tick        tickFunc
 	now         func() time.Time
 
-	snapshot   app.Snapshot
-	selectedID string
-	startupErr error
-	started    bool
-	refreshing bool
-	generation uint64
-	width      int
-	palette    palette
-	cpuHistory []float64
+	snapshot     app.Snapshot
+	selectedID   string
+	startupErr   error
+	started      bool
+	refreshing   bool
+	generation   uint64
+	width        int
+	height       int
+	scrollOffset int // first visible session index, measured in sessions (not lines)
+	palette      palette
+	cpuHistory   []float64
 }
 
 func NewModel(coordinator Coordinator, interval time.Duration) Model {
@@ -76,6 +78,9 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 	case tea.WindowSizeMsg:
 		m.width = msg.Width
+		m.height = msg.Height
+		m.clampScrollOffset()
+		m.ensureSelectionVisible()
 		return m, nil
 	case startupMsg:
 		if msg.err != nil {
@@ -118,6 +123,10 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.moveSelection(-1)
 		case "down", "j":
 			m.moveSelection(1)
+		case "pgup":
+			m.moveSelection(-m.pageSize())
+		case "pgdown":
+			m.moveSelection(m.pageSize())
 		}
 		return m, nil
 	default:
@@ -141,8 +150,8 @@ func (m Model) startRefresh() (tea.Model, tea.Cmd) {
 }
 
 // recordCPU appends the total CPU usage across sessions to the sparkline
-// history. Nothing is recorded until at least one session reports a sample, so
-// the sparkline does not start with a meaningless flat zero.
+// history. Unsampled snapshots are skipped so a temporary collection gap is
+// not misrepresented as genuine zero utilization.
 func (m *Model) recordCPU() {
 	total := 0.0
 	sampled := false
@@ -152,7 +161,7 @@ func (m *Model) recordCPU() {
 			sampled = true
 		}
 	}
-	if !sampled && len(m.cpuHistory) == 0 {
+	if !sampled {
 		return
 	}
 	const maxSamples = 16
@@ -165,28 +174,115 @@ func (m *Model) recordCPU() {
 func (m *Model) reconcileSelection() {
 	if len(m.snapshot.Sessions) == 0 {
 		m.selectedID = ""
+		m.scrollOffset = 0
 		return
 	}
+	found := false
 	for _, session := range m.snapshot.Sessions {
 		if session.ID == m.selectedID {
-			return
+			found = true
+			break
 		}
 	}
-	m.selectedID = m.snapshot.Sessions[0].ID
+	if !found {
+		m.selectedID = m.snapshot.Sessions[0].ID
+	}
+	m.clampScrollOffset()
+	m.ensureSelectionVisible()
+}
+
+// layoutPlanForViewport recomputes the same budget render() uses, so scroll
+// bookkeeping (page size, auto-scroll) stays consistent with what is actually
+// drawn at the model's current width and height.
+func (m Model) layoutPlanForViewport() layoutPlan {
+	width := m.width
+	if width < 1 {
+		width = 80
+	}
+	height := m.height
+	if height < 1 {
+		height = 24
+	}
+	headerLines := len(truncateHeaderLines(m.headerLines(width), height))
+	hasSessions := len(m.snapshot.Sessions) > 0
+	headingEligible := width >= 80
+
+	detailLines := 0
+	if _, hasSelection := m.selectedSession(); hasSelection {
+		detailLines = detailPanelLineCount()
+	}
+	return planLayout(width, height, headerLines, len(m.snapshot.Warnings) > 0, headingEligible, hasSessions, detailLines)
+}
+
+// pageSize reports how many complete sessions are rendered in the current
+// window after overflow indicators take their share of the height budget.
+// Paging by that capacity cannot skip a session that was never visible.
+func (m Model) pageSize() int {
+	plan := m.layoutPlanForViewport()
+	start, end, _, _ := sessionWindow(len(m.snapshot.Sessions), m.scrollOffset, plan.viewportLines, plan.rowsPerSession)
+	size := end - start
+	if size < 1 {
+		size = 1
+	}
+	return size
+}
+
+// clampScrollOffset keeps the offset within [0, total-1] (or 0 when empty)
+// after the session list changes shape.
+func (m *Model) clampScrollOffset() {
+	total := len(m.snapshot.Sessions)
+	if total == 0 {
+		m.scrollOffset = 0
+		return
+	}
+	if m.scrollOffset < 0 {
+		m.scrollOffset = 0
+	}
+	if m.scrollOffset > total-1 {
+		m.scrollOffset = total - 1
+	}
+}
+
+// ensureSelectionVisible scrolls the minimum amount necessary so the selected
+// session's full row (both lines in 2-line modes) is inside the viewport.
+func (m *Model) ensureSelectionVisible() {
+	total := len(m.snapshot.Sessions)
+	if total == 0 {
+		return
+	}
+	index := m.selectedIndex()
+	plan := m.layoutPlanForViewport()
+
+	if index < m.scrollOffset {
+		m.scrollOffset = index
+	}
+	start, end, _, _ := sessionWindow(total, m.scrollOffset, plan.viewportLines, plan.rowsPerSession)
+	for index >= end && start < total {
+		m.scrollOffset++
+		start, end, _, _ = sessionWindow(total, m.scrollOffset, plan.viewportLines, plan.rowsPerSession)
+		if m.scrollOffset >= total {
+			break
+		}
+	}
+	m.clampScrollOffset()
+}
+
+func (m Model) selectedIndex() int {
+	for i, session := range m.snapshot.Sessions {
+		if session.ID == m.selectedID {
+			return i
+		}
+	}
+	return 0
 }
 
 func (m *Model) moveSelection(delta int) {
 	if len(m.snapshot.Sessions) == 0 {
 		m.selectedID = ""
+		m.scrollOffset = 0
 		return
 	}
-	index := 0
-	for i, session := range m.snapshot.Sessions {
-		if session.ID == m.selectedID {
-			index = i
-			break
-		}
-	}
+	index := m.selectedIndex()
 	index += delta
 	if index < 0 {
 		index = 0
@@ -195,4 +291,5 @@ func (m *Model) moveSelection(delta int) {
 		index = len(m.snapshot.Sessions) - 1
 	}
 	m.selectedID = m.snapshot.Sessions[index].ID
+	m.ensureSelectionVisible()
 }
