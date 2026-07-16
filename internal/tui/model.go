@@ -6,6 +6,7 @@ import (
 	tea "charm.land/bubbletea/v2"
 
 	"taskwatch/internal/app"
+	"taskwatch/internal/core"
 )
 
 const DefaultRefreshInterval = 2 * time.Second
@@ -156,10 +157,17 @@ func (m *Model) recordCPU() {
 	total := 0.0
 	sampled := false
 	for _, session := range m.snapshot.Sessions {
-		if session.Resources.CPUAvailable {
-			total += session.Resources.CPUPercent
-			sampled = true
+		if len(session.Processes) == 0 {
+			continue
 		}
+		if session.State != core.StateRunning && session.State != core.StateLeftovers {
+			return
+		}
+		if !session.Resources.CPUAvailable {
+			return
+		}
+		total += session.Resources.CPUPercent
+		sampled = true
 	}
 	if !sampled {
 		return
@@ -263,6 +271,14 @@ func (m *Model) ensureSelectionVisible() {
 		if m.scrollOffset >= total {
 			break
 		}
+	}
+	for m.scrollOffset > 0 {
+		candidate := m.scrollOffset - 1
+		candidateStart, candidateEnd, _, _ := sessionWindow(total, candidate, plan.viewportLines, plan.rowsPerSession)
+		if index < candidateStart || index >= candidateEnd {
+			break
+		}
+		m.scrollOffset = candidate
 	}
 	m.clampScrollOffset()
 }

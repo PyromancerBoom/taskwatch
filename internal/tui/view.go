@@ -15,6 +15,8 @@ import (
 // with the workspace and status that follow it so the header reads as one line.
 const brand = "TASKWATCH"
 
+const minimumTerminalWidth = 25
+
 // footerHints are tried widest-first; the first one whose plain text fits the
 // width is used, and the result is always clipped to exactly one line so the
 // layout budget can treat the footer as a constant-size region (see
@@ -359,6 +361,10 @@ func (m Model) render() string {
 	if height < 1 {
 		height = 24
 	}
+	if width < minimumTerminalWidth {
+		message := fmt.Sprintf("Window too narrow - resize to at least %d columns", minimumTerminalWidth)
+		return m.palette.warning.Render(clip(message, width))
+	}
 	if m.startupErr != nil {
 		return capLines(m.renderStartupError(width), height)
 	}
@@ -585,7 +591,8 @@ func (m Model) renderDetailPanel(width int, session core.Session) string {
 	started := session.StartedAt
 	startedText := "—"
 	if !started.IsZero() {
-		startedText = started.Format("15:04:05") + " (" + ageLabel(started, m.now()) + " ago)"
+		now := m.now()
+		startedText = started.In(now.Location()).Format("15:04:05") + " (" + ageLabel(started, now) + " ago)"
 	}
 
 	lines := []string{

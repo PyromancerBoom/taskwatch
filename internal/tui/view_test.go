@@ -88,6 +88,42 @@ func TestRenderingNeverOverflowsWidthsAtLeastForty(t *testing.T) {
 	}
 }
 
+func TestBelowMinimumWidthShowsResizeMessageInEveryState(t *testing.T) {
+	states := []struct {
+		name  string
+		model Model
+	}{
+		{name: "loading", model: func() Model { m := testModel(20, nil); m.started = false; return m }()},
+		{name: "error", model: func() Model {
+			m := testModel(20, nil)
+			m.started = false
+			m.startupErr = errors.New("blocked")
+			return m
+		}()},
+		{name: "empty", model: testModel(20, nil)},
+		{name: "dashboard", model: testModel(20, []core.Session{detailedSession()})},
+	}
+
+	for _, tc := range states {
+		t.Run(tc.name, func(t *testing.T) {
+			tc.model.height = 3
+			content := tc.model.View().Content
+			plain := flattenRendered(content)
+
+			assertWithinWidth(t, content, 20)
+			if len(strings.Split(content, "\n")) > tc.model.height {
+				t.Fatalf("fallback exceeded height %d:\n%s", tc.model.height, content)
+			}
+			if !strings.Contains(plain, "Window too narrow") {
+				t.Fatalf("fallback missing resize message:\n%s", content)
+			}
+			if strings.Contains(plain, "Warning:") || strings.Contains(plain, "TASKWATCH") {
+				t.Fatalf("full dashboard rendered below minimum width:\n%s", content)
+			}
+		})
+	}
+}
+
 // TestNarrowEmptyCopyWrapsWithoutLosingText was adapted for the friendlier
 // empty-state copy: a short headline plus a muted body line. The exact
 // wording changed, but the two facts it must convey (watches for Codex
@@ -655,6 +691,25 @@ func TestDetailPanelShowsSelectedSessionFieldsAtTallHeight(t *testing.T) {
 	}
 	if !strings.Contains(content, "╭") || !strings.Contains(content, "╰") {
 		t.Fatalf("detail panel is not bordered:\n%s", content)
+	}
+}
+
+func TestDetailPanelDisplaysStartedTimeInLocalTimezone(t *testing.T) {
+	local := time.FixedZone("IST", int((5*time.Hour+30*time.Minute)/time.Second))
+	now := time.Date(2026, 7, 16, 16, 33, 59, 0, local)
+	session := detailedSession()
+	session.StartedAt = time.Date(2026, 7, 16, 9, 24, 4, 0, time.UTC)
+
+	model := testModel(130, []core.Session{session})
+	model.height = 40
+	model.now = func() time.Time { return now }
+	plain := flattenRendered(model.View().Content)
+
+	if !strings.Contains(plain, "Started: 14:54:04 (1h ago)") {
+		t.Fatalf("detail panel did not convert UTC start time to local time:\n%s", model.View().Content)
+	}
+	if strings.Contains(plain, "Started: 09:24:04") {
+		t.Fatalf("detail panel displayed the raw UTC start time:\n%s", model.View().Content)
 	}
 }
 

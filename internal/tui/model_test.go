@@ -279,6 +279,33 @@ func TestWindowResizeKeepsSelectionVisibleAcrossRowModes(t *testing.T) {
 	}
 }
 
+func TestWindowResizeBackfillsExpandedViewport(t *testing.T) {
+	model := NewModel(&stubCoordinator{}, time.Second)
+	model.started = true
+	model.width = 130
+	model.height = 5
+	model.snapshot.Sessions = manySessions(12)
+	model.selectedID = "s00"
+
+	for i := 0; i < len(model.snapshot.Sessions); i++ {
+		model, _ = update(t, model, key("down"))
+	}
+	if model.scrollOffset == 0 {
+		t.Fatal("precondition: scrolling to the last session did not move the viewport")
+	}
+
+	model, _ = update(t, model, tea.WindowSizeMsg{Width: 130, Height: 50})
+	plan := model.layoutPlanForViewport()
+	start, end, _, _ := sessionWindow(len(model.snapshot.Sessions), model.scrollOffset, plan.viewportLines, plan.rowsPerSession)
+
+	if model.selectedID != "s11" {
+		t.Fatalf("selectedID = %q, want s11", model.selectedID)
+	}
+	if start != 0 || end != len(model.snapshot.Sessions) {
+		t.Fatalf("expanded window = [%d:%d], want all %d sessions", start, end, len(model.snapshot.Sessions))
+	}
+}
+
 func manySessions(n int) []core.Session {
 	sessions := make([]core.Session, n)
 	for i := range sessions {
@@ -301,12 +328,53 @@ func TestRecordCPUDistinguishesMissingSampleFromRealZero(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			model := NewModel(&stubCoordinator{}, time.Second)
 			model.cpuHistory = []float64{12.3}
-			model.snapshot.Sessions = []core.Session{{Resources: tc.resources}}
+			model.snapshot.Sessions = []core.Session{{
+				State:     core.StateRunning,
+				Processes: []core.Process{{PID: 1}},
+				Resources: tc.resources,
+			}}
 
 			model.recordCPU()
 
 			if !reflect.DeepEqual(model.cpuHistory, tc.want) {
 				t.Fatalf("cpuHistory = %v, want %v", model.cpuHistory, tc.want)
+			}
+		})
+	}
+}
+
+func TestRecordCPUSkipsIncompleteSnapshots(t *testing.T) {
+	tests := []struct {
+		name     string
+		sessions []core.Session
+	}{
+		{
+			name: "stale last-known sample",
+			sessions: []core.Session{{
+				State:     core.StateStale,
+				Processes: []core.Process{{PID: 1}},
+				Resources: core.ResourceUsage{CPUAvailable: true, CPUPercent: 12.3},
+			}},
+		},
+		{
+			name: "partly sampled sessions",
+			sessions: []core.Session{
+				{State: core.StateRunning, Processes: []core.Process{{PID: 1}}, Resources: core.ResourceUsage{CPUAvailable: true, CPUPercent: 8}},
+				{State: core.StateRunning, Processes: []core.Process{{PID: 2}}},
+			},
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			model := NewModel(&stubCoordinator{}, time.Second)
+			model.cpuHistory = []float64{5}
+			model.snapshot.Sessions = tc.sessions
+
+			model.recordCPU()
+
+			if !reflect.DeepEqual(model.cpuHistory, []float64{5}) {
+				t.Fatalf("cpuHistory = %v, want unchanged [5]", model.cpuHistory)
 			}
 		})
 	}
