@@ -4,6 +4,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"reflect"
 	"runtime"
 	"strings"
 	"sync"
@@ -23,6 +24,7 @@ type fakeStore struct {
 	sessions  []core.Session
 	loadErr   error
 	saveErr   error
+	saveErrs  []error
 	loadCalls int
 	saveCalls int
 	saved     [][]core.Session
@@ -36,7 +38,15 @@ func (store *fakeStore) Load() ([]core.Session, error) {
 func (store *fakeStore) Save(sessions []core.Session) error {
 	store.saveCalls++
 	store.saved = append(store.saved, cloneTestSessions(sessions))
+	if store.saveCalls <= len(store.saveErrs) {
+		return store.saveErrs[store.saveCalls-1]
+	}
 	return store.saveErr
+}
+
+type launchCall struct {
+	tool      core.Tool
+	workspace string
 }
 
 type fakeSupervisor struct {
@@ -44,9 +54,17 @@ type fakeSupervisor struct {
 	recoverErrs  []error
 	refreshed    [][]core.Session
 	refreshErrs  [][]error
+	launched     core.Session
+	launchErr    error
 	recoverCalls [][]core.Session
 	refreshCalls [][]core.Session
+	launchCalls  []launchCall
 	closeCalls   int
+}
+
+func (supervisor *fakeSupervisor) Launch(tool core.Tool, workspace string) (core.Session, error) {
+	supervisor.launchCalls = append(supervisor.launchCalls, launchCall{tool: tool, workspace: workspace})
+	return cloneSession(supervisor.launched), supervisor.launchErr
 }
 
 func (supervisor *fakeSupervisor) RecoverMany(sessions []core.Session) ([]core.Session, []error) {
@@ -89,6 +107,10 @@ func (supervisor *blockingSupervisor) RefreshMany(sessions []core.Session) ([]co
 		<-supervisor.refreshRelease
 	}
 	return cloneTestSessions(supervisor.refreshed), append([]error(nil), supervisor.refreshErrs...)
+}
+
+func (supervisor *blockingSupervisor) Launch(core.Tool, string) (core.Session, error) {
+	return core.Session{}, nil
 }
 
 func (supervisor *blockingSupervisor) Close() {
@@ -411,6 +433,9 @@ func TestRefreshNewlyExitedSavesOnlyNonExitedAndSaveFailureWarns(t *testing.T) {
 		t.Fatalf("newly exited row not retained in snapshot: %#v", snapshot.Sessions)
 	}
 	assertWarnings(t, snapshot.Warnings, []Warning{{Message: "save reconciled sessions: disk full"}})
+	if !coordinator.persistenceDirty {
+		t.Fatal("persistenceDirty = false, want true after reconciliation save failure")
+	}
 	if snapshot.RefreshedAt != cycleTwo {
 		t.Fatalf("RefreshedAt = %v, want %v", snapshot.RefreshedAt, cycleTwo)
 	}
@@ -422,9 +447,66 @@ func TestRefreshNewlyExitedSavesOnlyNonExitedAndSaveFailureWarns(t *testing.T) {
 	if findSession(t, next.Sessions, "active").State != core.StateExited {
 		t.Fatalf("exited row changed on later refresh: %#v", next.Sessions)
 	}
-	if len(next.Warnings) != 0 {
-		t.Fatalf("warnings accumulated across cycles: %#v", next.Warnings)
+	if store.saveCalls != 2 || strings.Join(ids(store.saved[1]), ",") != "staying" {
+		t.Fatalf("retry saved rows = %#v, want staying in second call", store.saved)
 	}
+	if !coordinator.persistenceDirty {
+		t.Fatal("persistenceDirty = false, want preserved after retry failure")
+	}
+	assertWarnings(t, next.Warnings, []Warning{{Message: "save reconciled sessions: disk full"}})
+}
+
+func TestRefreshDirtyPersistenceRetriesWithoutNewExitAndClearsOnSuccess(t *testing.T) {
+	workspace := t.TempDir()
+	launched := session("launched", core.ConfidenceSupervised, core.StateRunning, baseTime)
+	firstSaveErr := errors.New("first save failed")
+	store := &fakeStore{saveErrs: []error{firstSaveErr, nil}}
+	supervisor := &fakeSupervisor{
+		launched:    launched,
+		refreshed:   [][]core.Session{{launched}},
+		refreshErrs: [][]error{{nil}},
+	}
+	observer := &fakeObserver{results: []observation{{}}}
+	coordinator := newCoordinator(workspace, store, supervisor, observer, func() time.Time { return cycleTwo })
+	coordinator.refreshed = cycleOne
+	if _, err := coordinator.Launch(core.ToolCodexCLI); !errors.Is(err, firstSaveErr) {
+		t.Fatalf("Launch() error = %v, want first save failure", err)
+	}
+
+	got := coordinator.Refresh()
+
+	if store.saveCalls != 2 || strings.Join(ids(store.saved[1]), ",") != "launched" {
+		t.Fatalf("refresh retry saves = %#v, want complete launched set on second call", store.saved)
+	}
+	if coordinator.persistenceDirty {
+		t.Fatal("persistenceDirty = true, want cleared after successful refresh retry")
+	}
+	assertSnapshot(t, got, workspace, []string{"launched"}, nil, cycleTwo)
+}
+
+func TestRefreshDirtyPersistenceFailedRetryPreservesDirtyAndWarns(t *testing.T) {
+	workspace := t.TempDir()
+	launched := session("launched", core.ConfidenceSupervised, core.StateRunning, baseTime)
+	firstSaveErr := errors.New("first save failed")
+	retryErr := errors.New("retry still full")
+	store := &fakeStore{saveErrs: []error{firstSaveErr, retryErr}}
+	supervisor := &fakeSupervisor{
+		launched:    launched,
+		refreshed:   [][]core.Session{{launched}},
+		refreshErrs: [][]error{{nil}},
+	}
+	observer := &fakeObserver{results: []observation{{}}}
+	coordinator := newCoordinator(workspace, store, supervisor, observer, func() time.Time { return cycleTwo })
+	if _, err := coordinator.Launch(core.ToolCodexCLI); !errors.Is(err, firstSaveErr) {
+		t.Fatalf("Launch() error = %v, want first save failure", err)
+	}
+
+	got := coordinator.Refresh()
+
+	if store.saveCalls != 2 || !coordinator.persistenceDirty {
+		t.Fatalf("saveCalls/persistenceDirty = %d/%v, want 2/true", store.saveCalls, coordinator.persistenceDirty)
+	}
+	assertWarnings(t, got.Warnings, []Warning{{Message: "save reconciled sessions: retry still full"}})
 }
 
 func TestSnapshotsAreDeepCopies(t *testing.T) {
@@ -467,6 +549,406 @@ func TestSnapshotsAreDeepCopies(t *testing.T) {
 		if warning.Message == "mutated warning" {
 			t.Fatalf("warning mutation leaked into state: %#v", third.Warnings)
 		}
+	}
+}
+
+func TestSetWorkspaceTrimsResolvesRelativeAndChangesOnlyActiveWorkspace(t *testing.T) {
+	base := t.TempDir()
+	wantWorkspace := filepath.Join(base, "nested", "project")
+	if err := os.MkdirAll(wantWorkspace, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	managed := session("managed", core.ConfidenceSupervised, core.StateRunning, baseTime, process(1, baseTime))
+	managed.Workspace = "original-managed-workspace"
+	observed := session("observed", core.ConfidenceObserved, core.StateRunning, baseTime.Add(time.Minute), process(2, baseTime))
+	observed.Workspace = "original-observed-workspace"
+	store := &fakeStore{}
+	coordinator := newCoordinator(base, store, &fakeSupervisor{}, &fakeObserver{}, func() time.Time {
+		t.Fatal("SetWorkspace called the coordinator clock")
+		return time.Time{}
+	})
+	coordinator.supervised = []core.Session{managed}
+	coordinator.observed = []core.Session{observed}
+	coordinator.warnings = []Warning{{SessionID: "managed", Message: "existing warning"}}
+	coordinator.refreshed = cycleOne
+	before := coordinator.snapshot()
+
+	got, err := coordinator.SetWorkspace("  nested/project  ")
+
+	if err != nil {
+		t.Fatalf("SetWorkspace() error = %v", err)
+	}
+	want := before
+	want.Workspace = filepath.Clean(wantWorkspace)
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("SetWorkspace() snapshot = %#v, want only workspace changed to %#v", got, want)
+	}
+	if store.saveCalls != 0 {
+		t.Fatalf("Save calls = %d, want 0", store.saveCalls)
+	}
+	if findSession(t, got.Sessions, "managed").Workspace != "original-managed-workspace" || findSession(t, got.Sessions, "observed").Workspace != "original-observed-workspace" {
+		t.Fatalf("SetWorkspace() rewrote existing session workspaces: %#v", got.Sessions)
+	}
+}
+
+func TestSetWorkspaceUsesInjectableResolverWithTrimmedInput(t *testing.T) {
+	coordinator := newCoordinator("old-workspace", &fakeStore{}, &fakeSupervisor{}, &fakeObserver{}, func() time.Time { return cycleOne })
+	var gotBase, gotInput string
+	coordinator.resolveWorkspace = func(base, input string) (string, error) {
+		gotBase, gotInput = base, input
+		return "resolved-workspace", nil
+	}
+
+	got, err := coordinator.SetWorkspace("  child  ")
+
+	if err != nil {
+		t.Fatalf("SetWorkspace() error = %v", err)
+	}
+	if gotBase != "old-workspace" || gotInput != "child" {
+		t.Fatalf("resolver inputs = (%q, %q), want (%q, %q)", gotBase, gotInput, "old-workspace", "child")
+	}
+	if got.Workspace != "resolved-workspace" {
+		t.Fatalf("workspace = %q, want resolved-workspace", got.Workspace)
+	}
+}
+
+func TestSetWorkspaceRejectsInvalidInputWithoutChangingState(t *testing.T) {
+	base := t.TempDir()
+	filePath := filepath.Join(base, "not-a-directory")
+	if err := os.WriteFile(filePath, []byte("data"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	tests := []struct {
+		name  string
+		input string
+	}{
+		{name: "empty", input: "  \t  "},
+		{name: "missing", input: "missing"},
+		{name: "file", input: filePath},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			managed := session("managed", core.ConfidenceSupervised, core.StateRunning, baseTime, process(1, baseTime))
+			coordinator := newCoordinator(base, &fakeStore{}, &fakeSupervisor{}, &fakeObserver{}, func() time.Time { return cycleOne })
+			coordinator.supervised = []core.Session{managed}
+			coordinator.warnings = []Warning{{Message: "existing warning"}}
+			coordinator.refreshed = cycleOne
+			before := coordinator.snapshot()
+
+			got, err := coordinator.SetWorkspace(test.input)
+
+			if err == nil {
+				t.Fatalf("SetWorkspace(%q) error = nil, want invalid-workspace error", test.input)
+			}
+			if !reflect.DeepEqual(got, before) || !reflect.DeepEqual(coordinator.snapshot(), before) {
+				t.Fatalf("state after SetWorkspace(%q) = %#v / %#v, want unchanged %#v", test.input, got, coordinator.snapshot(), before)
+			}
+			got.Sessions[0].Processes[0].Name = "mutated"
+			if coordinator.snapshot().Sessions[0].Processes[0].Name == "mutated" {
+				t.Fatal("invalid SetWorkspace() returned mutable coordinator state")
+			}
+		})
+	}
+}
+
+func TestSetWorkspaceAfterCloseReturnsCopiedUnchangedSnapshot(t *testing.T) {
+	supervisor := &fakeSupervisor{}
+	coordinator := newCoordinator(t.TempDir(), &fakeStore{}, supervisor, &fakeObserver{}, func() time.Time { return cycleOne })
+	coordinator.supervised = []core.Session{session("managed", core.ConfidenceSupervised, core.StateRunning, baseTime, process(1, baseTime))}
+	coordinator.refreshed = cycleOne
+	before := coordinator.snapshot()
+	coordinator.Close()
+
+	got, err := coordinator.SetWorkspace(t.TempDir())
+
+	if !errors.Is(err, errCoordinatorClosed) {
+		t.Fatalf("SetWorkspace() error = %v, want coordinator-closed error", err)
+	}
+	if !reflect.DeepEqual(got, before) || !reflect.DeepEqual(coordinator.snapshot(), before) {
+		t.Fatalf("SetWorkspace() snapshot/state = %#v / %#v, want unchanged %#v", got, coordinator.snapshot(), before)
+	}
+	got.Sessions[0].Processes[0].Name = "mutated"
+	if coordinator.snapshot().Sessions[0].Processes[0].Name == "mutated" {
+		t.Fatal("closed SetWorkspace() returned mutable coordinator state")
+	}
+	if supervisor.closeCalls != 1 {
+		t.Fatalf("Supervisor.Close() calls = %d, want 1", supervisor.closeCalls)
+	}
+}
+
+func TestLaunchForwardsCurrentWorkspacePersistsSupervisedSessionsAndReturnsID(t *testing.T) {
+	for _, tool := range []core.Tool{core.ToolClaudeCLI, core.ToolCodexCLI} {
+		t.Run(string(tool), func(t *testing.T) {
+			initialWorkspace := t.TempDir()
+			workspace := t.TempDir()
+			running := session("running", core.ConfidenceSupervised, core.StateRunning, baseTime, process(1, baseTime))
+			running.Workspace = "original-running-workspace"
+			exited := session("exited", core.ConfidenceSupervised, core.StateExited, baseTime.Add(time.Minute))
+			exited.Workspace = "original-exited-workspace"
+			observed := session("observed", core.ConfidenceObserved, core.StateRunning, baseTime.Add(2*time.Minute))
+			launched := session("launched", core.ConfidenceSupervised, core.StateRunning, baseTime.Add(3*time.Minute), process(2, baseTime))
+			launched.Tool = tool
+			launched.Workspace = workspace
+			store := &fakeStore{}
+			supervisor := &fakeSupervisor{launched: launched}
+			coordinator := newCoordinator(initialWorkspace, store, supervisor, &fakeObserver{}, func() time.Time {
+				t.Fatal("Launch called the coordinator clock")
+				return time.Time{}
+			})
+			coordinator.supervised = []core.Session{running, exited}
+			coordinator.observed = []core.Session{observed}
+			coordinator.refreshed = cycleOne
+			if _, err := coordinator.SetWorkspace(workspace); err != nil {
+				t.Fatalf("SetWorkspace() error = %v", err)
+			}
+
+			got, err := coordinator.Launch(tool)
+
+			if err != nil {
+				t.Fatalf("Launch() error = %v", err)
+			}
+			if len(supervisor.launchCalls) != 1 || supervisor.launchCalls[0] != (launchCall{tool: tool, workspace: workspace}) {
+				t.Fatalf("Supervisor.Launch calls = %#v, want tool %q workspace %q", supervisor.launchCalls, tool, workspace)
+			}
+			if got.SessionID != "launched" {
+				t.Fatalf("LaunchResult.SessionID = %q, want launched", got.SessionID)
+			}
+			assertSnapshot(t, got.Snapshot, workspace, []string{"running", "exited", "observed", "launched"}, nil, cycleOne)
+			if findSession(t, got.Snapshot.Sessions, "running").Workspace != "original-running-workspace" || findSession(t, got.Snapshot.Sessions, "exited").Workspace != "original-exited-workspace" {
+				t.Fatalf("Launch() rewrote original workspaces: %#v", got.Snapshot.Sessions)
+			}
+			if store.saveCalls != 1 || strings.Join(ids(store.saved[0]), ",") != "running,launched" {
+				t.Fatalf("saved sessions = %#v, want non-exited supervised IDs running,launched", store.saved)
+			}
+			got.Snapshot.Sessions[3].Processes[0].Name = "mutated"
+			if findSession(t, coordinator.snapshot().Sessions, "launched").Processes[0].Name == "mutated" {
+				t.Fatal("Launch() returned mutable coordinator state")
+			}
+		})
+	}
+}
+
+func TestLaunchSupervisorFailureLeavesStateUnchangedAndDoesNotSave(t *testing.T) {
+	launchErr := errors.New("executable missing")
+	workspace := t.TempDir()
+	store := &fakeStore{}
+	supervisor := &fakeSupervisor{launchErr: launchErr}
+	coordinator := newCoordinator(workspace, store, supervisor, &fakeObserver{}, func() time.Time { return cycleOne })
+	coordinator.supervised = []core.Session{session("running", core.ConfidenceSupervised, core.StateRunning, baseTime, process(1, baseTime))}
+	coordinator.warnings = []Warning{{Message: "existing warning"}}
+	coordinator.refreshed = cycleOne
+	before := coordinator.snapshot()
+
+	got, err := coordinator.Launch(core.ToolCodexCLI)
+
+	if !errors.Is(err, launchErr) {
+		t.Fatalf("Launch() error = %v, want wrapped supervisor error", err)
+	}
+	if got.SessionID != "" || !reflect.DeepEqual(got.Snapshot, before) || !reflect.DeepEqual(coordinator.snapshot(), before) {
+		t.Fatalf("Launch() result/state = %#v / %#v, want empty ID and unchanged %#v", got, coordinator.snapshot(), before)
+	}
+	if store.saveCalls != 0 {
+		t.Fatalf("Save calls = %d, want 0", store.saveCalls)
+	}
+	got.Snapshot.Sessions[0].Processes[0].Name = "mutated"
+	if coordinator.snapshot().Sessions[0].Processes[0].Name == "mutated" {
+		t.Fatal("failed Launch() returned mutable coordinator state")
+	}
+}
+
+func TestLaunchSaveFailureRetainsLiveSessionMarksDirtyAndWarns(t *testing.T) {
+	saveErr := errors.New("disk full")
+	workspace := t.TempDir()
+	launched := session("launched", core.ConfidenceSupervised, core.StateRunning, baseTime, process(2, baseTime))
+	launched.Workspace = workspace
+	store := &fakeStore{saveErr: saveErr}
+	supervisor := &fakeSupervisor{launched: launched}
+	coordinator := newCoordinator(workspace, store, supervisor, &fakeObserver{}, func() time.Time { return cycleOne })
+	coordinator.refreshed = cycleOne
+
+	got, err := coordinator.Launch(core.ToolCodexCLI)
+
+	if !errors.Is(err, saveErr) {
+		t.Fatalf("Launch() error = %v, want wrapped save error", err)
+	}
+	if got.SessionID != "launched" || findOptional(got.Snapshot.Sessions, "launched") == nil || findOptional(coordinator.snapshot().Sessions, "launched") == nil {
+		t.Fatalf("Launch() result/state = %#v / %#v, want retained live session", got, coordinator.snapshot())
+	}
+	if store.saveCalls != 1 || strings.Join(ids(store.saved[0]), ",") != "launched" {
+		t.Fatalf("saved sessions = %#v, want launched", store.saved)
+	}
+	if !coordinator.persistenceDirty {
+		t.Fatal("persistenceDirty = false, want true after save failure")
+	}
+	if len(got.Snapshot.Warnings) != 1 || got.Snapshot.Warnings[0].SessionID != "launched" || !strings.Contains(got.Snapshot.Warnings[0].Message, "disk full") {
+		t.Fatalf("warnings = %#v, want session-specific save warning", got.Snapshot.Warnings)
+	}
+	if got.Snapshot.RefreshedAt != cycleOne {
+		t.Fatalf("RefreshedAt = %v, want unchanged %v", got.Snapshot.RefreshedAt, cycleOne)
+	}
+}
+
+func TestRepeatedLaunchSaveFailuresDoNotAccumulateDuplicateWarnings(t *testing.T) {
+	workspace := t.TempDir()
+	first := session("first", core.ConfidenceSupervised, core.StateRunning, baseTime)
+	second := session("second", core.ConfidenceSupervised, core.StateRunning, baseTime.Add(time.Minute))
+	store := &fakeStore{saveErr: errors.New("disk full")}
+	supervisor := &fakeSupervisor{launched: first}
+	coordinator := newCoordinator(workspace, store, supervisor, &fakeObserver{}, func() time.Time { return cycleOne })
+	if _, err := coordinator.Launch(core.ToolCodexCLI); err == nil {
+		t.Fatal("first Launch() error = nil, want save failure")
+	}
+	supervisor.launched = second
+
+	got, err := coordinator.Launch(core.ToolClaudeCLI)
+
+	if err == nil {
+		t.Fatal("second Launch() error = nil, want save failure")
+	}
+	if len(got.Snapshot.Warnings) != 1 || got.Snapshot.Warnings[0].SessionID != "second" {
+		t.Fatalf("warnings = %#v, want single warning for latest failed launch, not an accumulation", got.Snapshot.Warnings)
+	}
+}
+
+func TestLaterSuccessfulLaunchSaveClearsDirtyAndPersistsCompleteSet(t *testing.T) {
+	workspace := t.TempDir()
+	first := session("first", core.ConfidenceSupervised, core.StateRunning, baseTime)
+	second := session("second", core.ConfidenceSupervised, core.StateRunning, baseTime.Add(time.Minute))
+	store := &fakeStore{saveErr: errors.New("disk full")}
+	supervisor := &fakeSupervisor{launched: first}
+	coordinator := newCoordinator(workspace, store, supervisor, &fakeObserver{}, func() time.Time { return cycleOne })
+	if _, err := coordinator.Launch(core.ToolCodexCLI); err == nil {
+		t.Fatal("first Launch() error = nil, want save failure")
+	}
+	store.saveErr = nil
+	supervisor.launched = second
+
+	got, err := coordinator.Launch(core.ToolClaudeCLI)
+
+	if err != nil {
+		t.Fatalf("second Launch() error = %v", err)
+	}
+	if coordinator.persistenceDirty {
+		t.Fatal("persistenceDirty = true, want false after complete successful save")
+	}
+	if got.SessionID != "second" || store.saveCalls != 2 || strings.Join(ids(store.saved[1]), ",") != "first,second" {
+		t.Fatalf("second result/saved = %#v / %#v, want second and complete first,second set", got, store.saved)
+	}
+	if len(got.Snapshot.Warnings) != 0 {
+		t.Fatalf("warnings = %#v, want stale save-failure warning cleared by later successful launch", got.Snapshot.Warnings)
+	}
+}
+
+func TestLaunchAfterCloseReturnsCopiedUnchangedSnapshotWithoutDependencies(t *testing.T) {
+	store := &fakeStore{}
+	supervisor := &fakeSupervisor{launched: session("unexpected", core.ConfidenceSupervised, core.StateRunning, baseTime)}
+	coordinator := newCoordinator(t.TempDir(), store, supervisor, &fakeObserver{}, func() time.Time { return cycleOne })
+	coordinator.supervised = []core.Session{session("managed", core.ConfidenceSupervised, core.StateRunning, baseTime, process(1, baseTime))}
+	coordinator.refreshed = cycleOne
+	before := coordinator.snapshot()
+	coordinator.Close()
+
+	got, err := coordinator.Launch(core.ToolCodexCLI)
+
+	if !errors.Is(err, errCoordinatorClosed) {
+		t.Fatalf("Launch() error = %v, want coordinator-closed error", err)
+	}
+	if got.SessionID != "" || !reflect.DeepEqual(got.Snapshot, before) || !reflect.DeepEqual(coordinator.snapshot(), before) {
+		t.Fatalf("Launch() result/state = %#v / %#v, want unchanged %#v", got, coordinator.snapshot(), before)
+	}
+	if len(supervisor.launchCalls) != 0 || store.saveCalls != 0 {
+		t.Fatalf("dependency calls after Close() = launch %d, save %d; want zero", len(supervisor.launchCalls), store.saveCalls)
+	}
+	got.Snapshot.Sessions[0].Processes[0].Name = "mutated"
+	if coordinator.snapshot().Sessions[0].Processes[0].Name == "mutated" {
+		t.Fatal("closed Launch() returned mutable coordinator state")
+	}
+}
+
+func TestInspectReturnsCachedProcessTreeWithoutCallingDependencies(t *testing.T) {
+	managed := session(
+		"managed",
+		core.ConfidenceSupervised,
+		core.StateLeftovers,
+		baseTime,
+		core.Process{PID: 12, ParentPID: 11, Name: "grandchild.exe", CreatedAt: baseTime.Add(2 * time.Second)},
+		core.Process{PID: 10, ParentPID: 999, Name: "leftover-root.exe", CreatedAt: baseTime},
+		core.Process{PID: 11, ParentPID: 10, Name: "child.exe", CreatedAt: baseTime.Add(time.Second)},
+	)
+	observed := session("observed", core.ConfidenceObserved, core.StateRunning, baseTime, process(20, baseTime))
+	store := &fakeStore{}
+	supervisor := &fakeSupervisor{}
+	observer := &fakeObserver{}
+	coordinator := newCoordinator("workspace", store, supervisor, observer, func() time.Time {
+		t.Fatal("Inspect called the coordinator clock")
+		return time.Time{}
+	})
+	coordinator.supervised = []core.Session{managed}
+	coordinator.observed = []core.Session{observed}
+
+	got, err := coordinator.Inspect("managed")
+
+	if err != nil {
+		t.Fatalf("Inspect() error = %v", err)
+	}
+	if got.Session.ID != "managed" || got.Session.Processes[0].PID != 12 {
+		t.Fatalf("Inspect() session = %#v, want cloned cached session", got.Session)
+	}
+	if len(got.Rows) != 3 || got.Rows[0].Process.PID != 10 || got.Rows[0].Depth != 0 || got.Rows[1].Process.PID != 11 || got.Rows[1].Depth != 1 || got.Rows[2].Process.PID != 12 || got.Rows[2].Depth != 2 {
+		t.Fatalf("Inspect() rows = %#v, want deterministic preorder", got.Rows)
+	}
+	if store.loadCalls != 0 || store.saveCalls != 0 || len(supervisor.recoverCalls) != 0 || len(supervisor.refreshCalls) != 0 || supervisor.closeCalls != 0 || len(observer.calls) != 0 {
+		t.Fatalf("dependency calls after Inspect() = load %d, save %d, recover %d, refresh %d, close %d, observe %d; want all zero", store.loadCalls, store.saveCalls, len(supervisor.recoverCalls), len(supervisor.refreshCalls), supervisor.closeCalls, len(observer.calls))
+	}
+
+	got.Session.ID = "mutated"
+	got.Session.Processes[0].Name = "mutated"
+	got.Rows[0].Process.Name = "mutated"
+	got.Rows = nil
+
+	again, err := coordinator.Inspect("managed")
+	if err != nil {
+		t.Fatalf("second Inspect() error = %v", err)
+	}
+	if again.Session.ID != "managed" || again.Session.Processes[0].Name == "mutated" || len(again.Rows) != 3 || again.Rows[0].Process.Name == "mutated" {
+		t.Fatalf("Inspect() caller mutation leaked into coordinator state: %#v", again)
+	}
+	observedTree, err := coordinator.Inspect("observed")
+	if err != nil || observedTree.Session.ID != "observed" {
+		t.Fatalf("Inspect() observed tree = %#v, %v", observedTree, err)
+	}
+}
+
+func TestInspectReturnsSentinelForUnknownSession(t *testing.T) {
+	coordinator := newCoordinator("workspace", &fakeStore{}, &fakeSupervisor{}, &fakeObserver{}, func() time.Time { return cycleOne })
+	coordinator.supervised = []core.Session{session("known", core.ConfidenceSupervised, core.StateRunning, baseTime)}
+
+	got, err := coordinator.Inspect("missing")
+
+	if !errors.Is(err, ErrSessionNotFound) {
+		t.Fatalf("Inspect() error = %v, want ErrSessionNotFound", err)
+	}
+	if !reflect.DeepEqual(got, ProcessTree{}) {
+		t.Fatalf("Inspect() tree = %#v, want zero tree", got)
+	}
+}
+
+func TestInspectAfterCloseReturnsCoordinatorClosedErrorAndZeroTree(t *testing.T) {
+	supervisor := &fakeSupervisor{}
+	coordinator := newCoordinator("workspace", &fakeStore{}, supervisor, &fakeObserver{}, func() time.Time { return cycleOne })
+	coordinator.supervised = []core.Session{session("known", core.ConfidenceSupervised, core.StateRunning, baseTime)}
+	coordinator.Close()
+
+	got, err := coordinator.Inspect("known")
+
+	if !errors.Is(err, errCoordinatorClosed) {
+		t.Fatalf("Inspect() error = %v, want coordinator-closed error", err)
+	}
+	if !reflect.DeepEqual(got, ProcessTree{}) {
+		t.Fatalf("Inspect() tree = %#v, want zero tree", got)
+	}
+	if supervisor.closeCalls != 1 {
+		t.Fatalf("Supervisor.Close() calls = %d after Inspect(), want unchanged 1", supervisor.closeCalls)
 	}
 }
 

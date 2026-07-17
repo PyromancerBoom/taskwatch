@@ -55,7 +55,7 @@ func TestFullRenderingShowsHeaderEveryColumnAndFooter(t *testing.T) {
 		"TASKWATCH", `C:\repo\taskwatch`, "● LIVE · 03:04:05",
 		"APP", "TRACKING", "STATUS", "PROCESSES", "CPU", "MEMORY", "AGE", "FOLDER",
 		"Codex CLI", "managed", "running", "2", "12.3%", "1.5 MB", "2h", `C:\repo`,
-		"↑/↓ or j/k move", "r refresh", "Ctrl+C close (apps keep running)",
+		"Enter inspect", "w workspace", "c/x launch", "r refresh", "↑/↓ move", "Ctrl+C close",
 	} {
 		if !strings.Contains(content, want) {
 			t.Errorf("full view missing %q:\n%s", want, content)
@@ -63,6 +63,36 @@ func TestFullRenderingShowsHeaderEveryColumnAndFooter(t *testing.T) {
 	}
 	if strings.Contains(content, "q quit") {
 		t.Fatalf("footer advertises unsupported q key:\n%s", content)
+	}
+}
+
+func TestDashboardFooterAdvertisesOnlyScopedActionsAcrossWidths(t *testing.T) {
+	for _, width := range []int{25, 40, 90, 130} {
+		t.Run(fmt.Sprintf("width_%d", width), func(t *testing.T) {
+			model := testModel(width, []core.Session{detailedSession()})
+			model.height = 24
+			content := model.View().Content
+			lines := strings.Split(content, "\n")
+			got := flattenRendered(lines[len(lines)-1])
+			if got != footerLine(width) {
+				t.Fatalf("footer = %q, want %q", got, footerLine(width))
+			}
+			for _, want := range []string{"Enter", "w", "c/x", "r", "↑"} {
+				if !strings.Contains(got, want) {
+					t.Fatalf("width %d footer missing %q: %q", width, want, got)
+				}
+			}
+			if !strings.Contains(got, "Ctrl+C") && !strings.Contains(got, "^C") {
+				t.Fatalf("width %d footer missing Ctrl+C: %q", width, got)
+			}
+			lower := strings.ToLower(got)
+			for _, forbidden := range []string{"j/k", "q quit", "terminate", "safe exit"} {
+				if strings.Contains(lower, forbidden) {
+					t.Fatalf("width %d footer advertises %q: %q", width, forbidden, got)
+				}
+			}
+			assertWithinWidth(t, content, width)
+		})
 	}
 }
 
@@ -267,21 +297,9 @@ func TestNarrowFooterStaysOneLineWithShortenedButLegibleWording(t *testing.T) {
 	content := testModel(width, []core.Session{detailedSession()}).View().Content
 
 	assertWithinWidth(t, content, width)
-	plain := flattenRendered(content)
-	for _, want := range []string{"move", "r refresh", "close"} {
-		if !strings.Contains(plain, want) {
-			t.Fatalf("width-%d footer lost shortened wording %q:\n%s", width, want, content)
-		}
-	}
 	lines := strings.Split(content, "\n")
-	footerLineCount := 0
-	for _, line := range lines {
-		if strings.Contains(flattenRendered(line), "refresh") {
-			footerLineCount++
-		}
-	}
-	if footerLineCount != 1 {
-		t.Fatalf("width-%d footer spans %d lines, want exactly 1", width, footerLineCount)
+	if got := flattenRendered(lines[len(lines)-1]); got != footerLine(width) {
+		t.Fatalf("width-%d footer = %q, want exact one-line %q", width, got, footerLine(width))
 	}
 }
 
@@ -593,7 +611,7 @@ func TestTinyHeightMatrixUsesBestEffortWithoutOverflow(t *testing.T) {
 				if len(lines) > height {
 					t.Fatalf("rendered %d lines, want <= %d:\n%s", len(lines), height, content)
 				}
-				if !strings.Contains(flattenRendered(lines[len(lines)-1]), "refresh") {
+				if flattenRendered(lines[len(lines)-1]) != footerLine(width) {
 					t.Fatalf("footer is not last at height %d width %d:\n%s", height, width, content)
 				}
 				plan := model.layoutPlanForViewport()
@@ -650,7 +668,7 @@ func TestHeightWidthMatrixNeverOverflowsAndKeepsFooterLast(t *testing.T) {
 					}
 
 					last := flattenRendered(lines[len(lines)-1])
-					if !strings.Contains(last, "refresh") {
+					if last != footerLine(width) {
 						t.Fatalf("footer hint not on last line (height %d width %d): %q\nfull:\n%s", height, width, last, content)
 					}
 
@@ -750,6 +768,326 @@ func TestDetailPanelAbsentWithoutSelection(t *testing.T) {
 	if strings.Contains(content, "Selected Session") {
 		t.Fatalf("detail panel should not appear without a selection:\n%s", content)
 	}
+}
+
+func inspectionTestModel(width, height int, tree app.ProcessTree, inspectionErr error, pending bool) Model {
+	model := testModel(width, []core.Session{tree.Session})
+	model.height = height
+	model.screen = screenInspection
+	model.inspectionSessionID = tree.Session.ID
+	model.inspectionTree = tree
+	model.inspectionErr = inspectionErr
+	model.inspectionPending = pending
+	return model
+}
+
+func inspectionTreeWithRows(rows []core.ProcessTreeRow) app.ProcessTree {
+	session := detailedSession()
+	session.ID = "inspect-me"
+	session.Workspace = `C:\repo\inspected`
+	return app.ProcessTree{Session: session, Rows: rows}
+}
+
+func TestInspectionWideAndNarrowViewsShowContextAndProcessFields(t *testing.T) {
+	created := time.Date(2026, 7, 15, 1, 2, 3, 0, time.UTC)
+	tree := inspectionTreeWithRows([]core.ProcessTreeRow{{
+		Depth: 2,
+		Process: core.Process{
+			PID: 4242, ParentPID: 4000, Name: "language-server", CreatedAt: created,
+			CPUPercent: 7.5, MemoryBytes: 1572864, CPUAvailable: true, MemoryAvailable: true,
+		},
+	}})
+
+	for _, width := range []int{130, 60} {
+		t.Run(fmt.Sprintf("width_%d", width), func(t *testing.T) {
+			model := inspectionTestModel(width, 24, tree, nil, false)
+			model.now = func() time.Time { return time.Date(2026, 7, 15, 3, 4, 5, 0, time.UTC) }
+			content := model.View().Content
+			plain := flattenRendered(content)
+
+			for _, want := range []string{
+				"Process Tree", "Codex CLI", "managed", "running", `C:\repo\inspected`,
+				"language-server", "4242", "4000", "01:02:03", "7.5%", "1.5 MB",
+			} {
+				if !strings.Contains(plain, want) {
+					t.Fatalf("width %d missing %q:\n%s", width, want, content)
+				}
+			}
+			assertWithinWidth(t, content, width)
+		})
+	}
+}
+
+func TestInspectionVeryNarrowRowsKeepEveryFieldAndCapDeepStructure(t *testing.T) {
+	row := core.ProcessTreeRow{
+		Depth: 99,
+		Process: core.Process{
+			PID: 424242, ParentPID: 313131, Name: "deep-agent",
+			CreatedAt:  time.Date(2026, 7, 15, 1, 2, 3, 0, time.UTC),
+			CPUPercent: 37.5, MemoryBytes: 2621440, CPUAvailable: true, MemoryAvailable: true,
+		},
+	}
+
+	for _, tc := range []struct {
+		width, wantRows int
+	}{{width: 25, wantRows: 4}, {width: 40, wantRows: 3}} {
+		t.Run(fmt.Sprintf("width_%d", tc.width), func(t *testing.T) {
+			model := inspectionTestModel(tc.width, 30, inspectionTreeWithRows([]core.ProcessTreeRow{row}), nil, false)
+			model.now = func() time.Time { return time.Date(2026, 7, 15, 3, 4, 5, 0, time.UTC) }
+
+			renderedRows := model.renderInspectionProcess(row, tc.width)
+			if len(renderedRows) != tc.wantRows || inspectionRowsPerProcess(tc.width) != tc.wantRows {
+				t.Fatalf("width %d row cost = rendered %d/model %d, want %d", tc.width, len(renderedRows), inspectionRowsPerProcess(tc.width), tc.wantRows)
+			}
+			content := model.View().Content
+			plain := flattenRendered(content)
+			for _, want := range []string{"deep-agent", "424242", "313131", "01:02:03", "37.5%", "2.5 MB"} {
+				if !strings.Contains(plain, want) {
+					t.Fatalf("width %d clipped required field %q:\n%s", tc.width, want, content)
+				}
+			}
+			assertWithinWidth(t, content, tc.width)
+		})
+	}
+}
+
+func TestInspectionRenderingUsesSuppliedDepthInsteadOfParentTopology(t *testing.T) {
+	process := core.Process{PID: 22, ParentPID: 11, Name: "worker"}
+	rootDepth := inspectionTestModel(130, 20, inspectionTreeWithRows([]core.ProcessTreeRow{{Process: process, Depth: 0}}), nil, false)
+	nestedDepth := inspectionTestModel(130, 20, inspectionTreeWithRows([]core.ProcessTreeRow{{Process: process, Depth: 3}}), nil, false)
+
+	rootPlain := flattenRendered(rootDepth.View().Content)
+	nestedPlain := flattenRendered(nestedDepth.View().Content)
+	if rootPlain == nestedPlain {
+		t.Fatal("changing supplied Depth did not change rendered topology")
+	}
+	if !strings.Contains(nestedPlain, "      └─ worker") {
+		t.Fatalf("Depth 3 indentation missing despite unchanged ParentPID:\n%s", nestedDepth.View().Content)
+	}
+}
+
+func TestInspectionPendingEmptyUnavailableAndOtherErrorStates(t *testing.T) {
+	tree := inspectionTreeWithRows(nil)
+	tests := []struct {
+		name    string
+		pending bool
+		err     error
+		want    string
+	}{
+		{name: "pending", pending: true, want: "Loading process tree"},
+		{name: "empty", want: "No processes remain"},
+		{name: "unavailable", err: app.ErrSessionNotFound, want: "Session unavailable"},
+		{name: "other error", err: errors.New("access denied"), want: "Unable to inspect: access denied"},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			content := inspectionTestModel(90, 16, tree, tc.err, tc.pending).View().Content
+			if !strings.Contains(flattenRendered(content), tc.want) {
+				t.Fatalf("state missing %q:\n%s", tc.want, content)
+			}
+		})
+	}
+}
+
+func TestInspectionViewportScrollsAndReportsHiddenRows(t *testing.T) {
+	rows := make([]core.ProcessTreeRow, 8)
+	for i := range rows {
+		rows[i].Process = core.Process{PID: uint32(i + 1), Name: fmt.Sprintf("process-%02d", i)}
+	}
+	model := inspectionTestModel(130, 9, inspectionTreeWithRows(rows), nil, false)
+	model.inspectionScrollOffset = 4
+	content := model.View().Content
+	plain := flattenRendered(content)
+
+	if strings.Contains(plain, "process-00") || !strings.Contains(plain, "process-04") || !strings.Contains(plain, "more") {
+		t.Fatalf("inspection viewport did not honor offset/overflow:\n%s", content)
+	}
+}
+
+func TestInspectionResizeMatrixCapsWidthHeightAndKeepsFooterLast(t *testing.T) {
+	rows := make([]core.ProcessTreeRow, 12)
+	for i := range rows {
+		rows[i].Process = core.Process{PID: uint32(i + 1), ParentPID: 1, Name: fmt.Sprintf("process-%02d-with-a-long-name", i)}
+	}
+	tree := inspectionTreeWithRows(rows)
+
+	for _, width := range []int{minimumTerminalWidth, 40, 90, 130} {
+		for _, height := range []int{1, 3, 8, 24} {
+			t.Run(fmt.Sprintf("w%d_h%d", width, height), func(t *testing.T) {
+				model := inspectionTestModel(width, height, tree, nil, false)
+				content := model.View().Content
+				assertWithinWidth(t, content, width)
+				lines := strings.Split(content, "\n")
+				if len(lines) > height {
+					t.Fatalf("rendered %d lines, want <= %d:\n%s", len(lines), height, content)
+				}
+				last := flattenRendered(lines[len(lines)-1])
+				if last != inspectionFooterLine(width) {
+					t.Fatalf("footer not last at %dx%d: got %q want %q\n%s", width, height, last, inspectionFooterLine(width), content)
+				}
+			})
+		}
+	}
+}
+
+func TestInspectionFooterAdvertisesOnlyReadOnlyInspectionKeys(t *testing.T) {
+	content := inspectionTestModel(130, 20, inspectionTreeWithRows(nil), nil, false).View().Content
+	plain := flattenRendered(content)
+	for _, want := range []string{"↑/↓", "PgUp/PgDn", "r refresh", "Enter/Esc back", "Ctrl+C"} {
+		if !strings.Contains(plain, want) {
+			t.Fatalf("inspection footer missing %q:\n%s", want, content)
+		}
+	}
+	for _, forbidden := range []string{"terminate", "kill", "q quit"} {
+		if strings.Contains(strings.ToLower(plain), forbidden) {
+			t.Fatalf("inspection footer advertises %q:\n%s", forbidden, content)
+		}
+	}
+}
+
+func TestWorkspacePickerViewShowsOrderedChoicesActiveMarkerAndScopedFooter(t *testing.T) {
+	model := testModel(90, []core.Session{
+		{ID: "z", Workspace: `C:\zeta`},
+		{ID: "a", Workspace: `C:\alpha`},
+	})
+	model.height = 12
+	model.screen = screenWorkspacePicker
+	model.workspaceChoices = workspaceChoices(model.snapshot)
+	content := model.View().Content
+	plain := flattenRendered(content)
+
+	for _, want := range []string{"Choose workspace", `C:\repo\taskwatch`, "active", `C:\alpha`, `C:\zeta`, "Enter another folder…", "PgUp/PgDn", "Enter select", "Esc back", "Ctrl+C"} {
+		if !strings.Contains(plain, want) {
+			t.Fatalf("workspace picker missing %q:\n%s", want, content)
+		}
+	}
+	if strings.Index(plain, `C:\repo\taskwatch`) > strings.Index(plain, `C:\alpha`) || strings.Index(plain, `C:\alpha`) > strings.Index(plain, `C:\zeta`) {
+		t.Fatalf("workspace picker order is wrong:\n%s", content)
+	}
+	assertWithinWidth(t, content, model.width)
+	lines := strings.Split(content, "\n")
+	if got := flattenRendered(lines[len(lines)-1]); got != workspacePickerFooterLine(model.width) {
+		t.Fatalf("workspace picker footer = %q, want %q", got, workspacePickerFooterLine(model.width))
+	}
+}
+
+func TestWorkspaceEditorRendersVisibleCursorAndHorizontallyWindowsLongDraft(t *testing.T) {
+	model := testModel(25, nil)
+	model.height = 8
+	model.screen = screenWorkspaceEditor
+	model.workspaceDraft = `C:\a-very-long-parent\nested\kq-final`
+	model.workspaceCursor = len([]rune(model.workspaceDraft))
+	content := model.View().Content
+	plain := flattenRendered(content)
+
+	assertWithinWidth(t, content, model.width)
+	if !strings.Contains(plain, "Workspace folder") || !strings.Contains(plain, "│") {
+		t.Fatalf("workspace editor missing label/cursor:\n%s", content)
+	}
+	if !strings.Contains(plain, "kq-final") || strings.Contains(plain, "a-very-long-parent") {
+		t.Fatalf("workspace editor did not window around cursor:\n%s", content)
+	}
+	lines := strings.Split(content, "\n")
+	if got := flattenRendered(lines[len(lines)-1]); got != workspaceEditorFooterLine(model.width, false) {
+		t.Fatalf("workspace editor footer = %q, want %q", got, workspaceEditorFooterLine(model.width, false))
+	}
+}
+
+func TestWorkspaceEditorWindowFitsWidthWithInteriorCursor(t *testing.T) {
+	draft := `C:\a-very-long-parent-folder\nested\deep\kq-final-segment-here`
+	runes := []rune(draft)
+	for _, width := range []int{4, 5, 6, 8, 10, 15} {
+		for cursor := 0; cursor <= len(runes); cursor++ {
+			got := workspaceEditorWindow(draft, cursor, width)
+			if w := lipgloss.Width(got); w > width {
+				t.Fatalf("workspaceEditorWindow(cursor=%d, width=%d) = %q, width %d exceeds budget %d", cursor, width, got, w, width)
+			}
+			if !strings.Contains(got, "│") {
+				t.Fatalf("workspaceEditorWindow(cursor=%d, width=%d) = %q, missing cursor glyph", cursor, width, got)
+			}
+		}
+	}
+}
+
+func TestWorkspaceEditorWindowFitsWidthWithWideRunesAndInteriorCursor(t *testing.T) {
+	draft := `C:\目录\很长的中文文件夹名称测试路径\末尾`
+	runes := []rune(draft)
+	for _, width := range []int{6, 8, 10, 12, 18, 19} {
+		for cursor := 0; cursor <= len(runes); cursor++ {
+			got := workspaceEditorWindow(draft, cursor, width)
+			if w := lipgloss.Width(got); w > width {
+				t.Fatalf("workspaceEditorWindow(cursor=%d, width=%d) = %q, width %d exceeds budget %d", cursor, width, got, w, width)
+			}
+		}
+	}
+}
+
+func TestWorkspaceEditorShowsInlineFailureAndPendingStatus(t *testing.T) {
+	model := testModel(60, nil)
+	model.height = 8
+	model.screen = screenWorkspaceEditor
+	model.workspaceDraft = `C:\missing`
+	model.workspaceCursor = len([]rune(model.workspaceDraft))
+	model.workspaceErr = errors.New("folder does not exist")
+	errorContent := flattenRendered(model.View().Content)
+	if !strings.Contains(errorContent, "folder does not exist") || !strings.Contains(errorContent, `C:\missing`) {
+		t.Fatalf("workspace editor lost inline failure/draft:\n%s", model.View().Content)
+	}
+
+	model.workspacePending = true
+	pendingContent := model.View().Content
+	pendingPlain := flattenRendered(pendingContent)
+	if !strings.Contains(pendingPlain, "Validating workspace") || !strings.Contains(pendingPlain, "Ctrl+C") {
+		t.Fatalf("workspace editor missing pending status:\n%s", pendingContent)
+	}
+	for _, forbidden := range []string{"Enter apply", "Esc back"} {
+		if strings.Contains(pendingPlain, forbidden) {
+			t.Fatalf("pending editor advertises %q:\n%s", forbidden, pendingContent)
+		}
+	}
+}
+
+func TestWorkspacePickerShowsKnownPathValidationStatusAndInlineFailure(t *testing.T) {
+	model := testModel(60, []core.Session{{ID: "known", Workspace: `C:\known`}})
+	model.height = 10
+	model.screen = screenWorkspacePicker
+	model.workspaceChoices = workspaceChoices(model.snapshot)
+	model.workspacePickerIndex = 1
+	model.workspaceDraft = `C:\known`
+	model.workspacePending = true
+
+	pending := flattenRendered(model.View().Content)
+	if !strings.Contains(pending, "Validating workspace") || !strings.Contains(pending, `C:\known`) {
+		t.Fatalf("known workspace pending state missing:\n%s", model.View().Content)
+	}
+
+	model.workspacePending = false
+	model.workspaceErr = errors.New("access denied")
+	failed := flattenRendered(model.View().Content)
+	if !strings.Contains(failed, "access denied") || !strings.Contains(failed, `C:\known`) {
+		t.Fatalf("known workspace inline failure missing:\n%s", model.View().Content)
+	}
+}
+
+func TestDashboardShowsLaunchingStatusAndFailureColoredActionBanner(t *testing.T) {
+	launching := testModel(90, []core.Session{detailedSession()})
+	launching.launchPending = true
+	launching.launchTool = core.ToolClaudeCLI
+	launchingPlain := flattenRendered(launching.View().Content)
+	if !strings.Contains(launchingPlain, "LAUNCHING CLAUDE CLI") || strings.Contains(launchingPlain, "LIVE") {
+		t.Fatalf("launching dashboard status is unclear:\n%s", launching.View().Content)
+	}
+
+	failed := testModel(90, []core.Session{detailedSession()})
+	failed.height = 15
+	failed.actionErr = errors.New("supervisor unavailable")
+	content := failed.View().Content
+	wantBanner := "Action failed: supervisor unavailable"
+	if !strings.Contains(flattenRendered(content), wantBanner) || !strings.Contains(content, failed.palette.failure.Render(wantBanner)) {
+		t.Fatalf("dashboard action failure is not a failure-colored banner:\n%s", content)
+	}
+	assertWithinWidth(t, content, failed.width)
 }
 
 // TestScrollFollowsSelectionToLastSessionAndBack exercises the scrolling

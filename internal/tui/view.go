@@ -1,6 +1,7 @@
 package tui
 
 import (
+	"errors"
 	"fmt"
 	"strings"
 	"time"
@@ -8,6 +9,7 @@ import (
 	tea "charm.land/bubbletea/v2"
 	"charm.land/lipgloss/v2"
 
+	"taskwatch/internal/app"
 	"taskwatch/internal/core"
 )
 
@@ -23,9 +25,33 @@ const minimumTerminalWidth = 25
 // planLayout). This trades footer wrapping for legibility of the key hints at
 // every width, including the narrowest supported one.
 var footerHints = []string{
-	"↑/↓ or j/k move  •  r refresh  •  Ctrl+C close (apps keep running)",
-	"↑/↓ move • r refresh • Ctrl+C close",
-	"↑↓ move • r refresh • ^C close",
+	"Enter inspect • w workspace • c/x launch • r refresh • ↑/↓ move • Ctrl+C close",
+	"Enter inspect • w • c/x • r • ↑↓ • ^C",
+	"Enter w c/x r ↑↓ ^C",
+}
+
+var inspectionFooterHints = []string{
+	"↑/↓ scroll  •  PgUp/PgDn page  •  r refresh  •  Enter/Esc back  •  Ctrl+C close",
+	"↑/↓ scroll • PgUp/PgDn • r refresh • Enter/Esc back • ^C close",
+	"↑↓ • r • Enter/Esc • ^C",
+}
+
+var workspacePickerFooterHints = []string{
+	"↑/↓ move  •  PgUp/PgDn page  •  Enter select  •  Esc back  •  Ctrl+C close",
+	"↑/↓ • PgUp/PgDn • Enter select • Esc back • ^C close",
+	"↑↓ • Enter • Esc • ^C",
+}
+
+var workspaceEditorFooterHints = []string{
+	"Enter apply  •  Esc back  •  Ctrl+C close",
+	"Enter apply • Esc back • ^C close",
+	"Enter • Esc • ^C",
+}
+
+var workspacePendingFooterHints = []string{
+	"Validating workspace…  •  Ctrl+C close",
+	"Validating… • ^C close",
+	"Validating… • ^C",
 }
 
 // footerLine picks the widest footer hint that fits on one line, falling back
@@ -38,6 +64,35 @@ func footerLine(width int) string {
 		}
 	}
 	return clip(footerHints[len(footerHints)-1], width)
+}
+
+func inspectionFooterLine(width int) string {
+	for _, hint := range inspectionFooterHints {
+		if lipgloss.Width(hint) <= width {
+			return hint
+		}
+	}
+	return clip(inspectionFooterHints[len(inspectionFooterHints)-1], width)
+}
+
+func workspacePickerFooterLine(width int) string {
+	return fittingFooterLine(workspacePickerFooterHints, width)
+}
+
+func workspaceEditorFooterLine(width int, pending bool) string {
+	if pending {
+		return fittingFooterLine(workspacePendingFooterHints, width)
+	}
+	return fittingFooterLine(workspaceEditorFooterHints, width)
+}
+
+func fittingFooterLine(hints []string, width int) string {
+	for _, hint := range hints {
+		if lipgloss.Width(hint) <= width {
+			return hint
+		}
+	}
+	return clip(hints[len(hints)-1], width)
 }
 
 type palette struct {
@@ -87,6 +142,13 @@ func newPalette(dark bool) palette {
 // in flight. Kept separate from styling so width bookkeeping (headerLines)
 // and rendering (headerLines styled variant) measure the exact same text.
 func (m Model) statusChipText() string {
+	if m.launchPending {
+		label := strings.ToUpper(toolLabel(m.launchTool))
+		if m.launchTool == core.ToolClaudeCLI {
+			label = "CLAUDE CLI"
+		}
+		return "LAUNCHING " + label
+	}
 	if m.refreshing {
 		return "↻ REFRESHING"
 	}
@@ -94,7 +156,7 @@ func (m Model) statusChipText() string {
 }
 
 func (m Model) statusChipStyle() lipgloss.Style {
-	if m.refreshing {
+	if m.refreshing || m.launchPending {
 		return m.palette.focus
 	}
 	return m.palette.healthy
@@ -371,6 +433,15 @@ func (m Model) render() string {
 	if !m.started {
 		return capLines(m.renderLoading(width, height), height)
 	}
+	if m.screen == screenInspection {
+		return m.renderInspection(width, height)
+	}
+	if m.screen == screenWorkspacePicker {
+		return m.renderWorkspacePicker(width, height)
+	}
+	if m.screen == screenWorkspaceEditor {
+		return m.renderWorkspaceEditor(width, height)
+	}
 
 	headerLines := truncateHeaderLines(m.headerLines(width), height)
 
@@ -382,7 +453,7 @@ func (m Model) render() string {
 	if hasSelection {
 		detailLines = detailPanelLineCount()
 	}
-	plan := planLayout(width, height, len(headerLines), len(m.snapshot.Warnings) > 0, headingEligible, hasSessions, detailLines)
+	plan := planLayout(width, height, len(headerLines), m.actionErr != nil || len(m.snapshot.Warnings) > 0, headingEligible, hasSessions, detailLines)
 
 	lines := append([]string{}, headerLines...)
 
@@ -392,19 +463,24 @@ func (m Model) render() string {
 	}
 
 	if plan.showWarning {
-		suffix := ""
-		if more := len(m.snapshot.Warnings) - 1; more > 0 {
-			suffix = fmt.Sprintf(" +%d more", more)
+		if m.actionErr != nil {
+			banner := clip("Action failed: "+m.actionErr.Error(), width)
+			lines = append(lines, m.palette.failure.Render(banner), "")
+		} else {
+			suffix := ""
+			if more := len(m.snapshot.Warnings) - 1; more > 0 {
+				suffix = fmt.Sprintf(" +%d more", more)
+			}
+			count := len(m.snapshot.Warnings)
+			label := fmt.Sprintf("⚠ %d warnings", count)
+			if count == 1 {
+				label = "⚠ 1 warning"
+			}
+			prefix := label + ": "
+			messageWidth := width - lipgloss.Width(prefix) - lipgloss.Width(suffix)
+			warning := prefix + clip(m.snapshot.Warnings[0].Message, messageWidth) + suffix
+			lines = append(lines, m.palette.warning.Render(warning), "")
 		}
-		count := len(m.snapshot.Warnings)
-		label := fmt.Sprintf("⚠ %d warnings", count)
-		if count == 1 {
-			label = "⚠ 1 warning"
-		}
-		prefix := label + ": "
-		messageWidth := width - lipgloss.Width(prefix) - lipgloss.Width(suffix)
-		warning := prefix + clip(m.snapshot.Warnings[0].Message, messageWidth) + suffix
-		lines = append(lines, m.palette.warning.Render(warning), "")
 	}
 
 	lines = append(lines, m.renderViewport(width, plan)...)
@@ -415,6 +491,379 @@ func (m Model) render() string {
 
 	lines = append(lines, footerLine(width))
 	return strings.Join(lines, "\n")
+}
+
+func (m Model) renderWorkspacePicker(width, height int) string {
+	header := truncateHeaderLines(m.headerLines(width), height)
+	footer := workspacePickerFooterLine(width)
+	if m.workspacePending {
+		footer = workspaceEditorFooterLine(width, true)
+	}
+	lines := append([]string{}, header...)
+	remaining := height - len(lines) - 1
+	if remaining < 0 {
+		remaining = 0
+	}
+	if remaining > 0 {
+		lines = append(lines, m.palette.focus.Render(clip("Choose workspace", width)))
+		remaining--
+	}
+
+	statusLines := 0
+	if m.workspacePending || m.workspaceErr != nil {
+		statusLines = 1
+	}
+	choiceLines := max(remaining-statusLines, 0)
+	start, end, showAbove, showBelow := sessionWindow(len(m.workspaceChoices), m.workspacePickerIndex, choiceLines, 1)
+	if showAbove {
+		lines = append(lines, m.palette.muted.Render(clip(fmt.Sprintf("↑ %d more", start), width)))
+	}
+	for index := start; index < end; index++ {
+		choice := m.workspaceChoices[index]
+		label := choice.path
+		if choice.other {
+			label = "Enter another folder…"
+		} else if index == 0 {
+			label += "  [active]"
+		}
+		prefix := "  "
+		style := m.palette.text
+		if index == m.workspacePickerIndex {
+			prefix = "▌ "
+			style = m.palette.focus
+		}
+		lines = append(lines, style.Render(clip(prefix+label, width)))
+	}
+	if showBelow {
+		lines = append(lines, m.palette.muted.Render(clip(fmt.Sprintf("↓ %d more", len(m.workspaceChoices)-end), width)))
+	}
+	if m.workspacePending && len(lines) < height-1 {
+		lines = append(lines, m.palette.focus.Render(clip("Validating workspace…", width)))
+	} else if m.workspaceErr != nil && len(lines) < height-1 {
+		message := "Unable to use workspace: " + m.workspaceErr.Error()
+		lines = append(lines, m.palette.failure.Render(clip(message, width)))
+	}
+	if len(lines) >= height && height > 0 {
+		lines = lines[:height-1]
+	}
+	lines = append(lines, footer)
+	return strings.Join(lines, "\n")
+}
+
+func (m Model) renderWorkspaceEditor(width, height int) string {
+	header := truncateHeaderLines(m.headerLines(width), height)
+	footer := workspaceEditorFooterLine(width, m.workspacePending)
+	lines := append([]string{}, header...)
+	remaining := height - len(lines) - 1
+	if remaining < 0 {
+		remaining = 0
+	}
+	if remaining > 0 {
+		lines = append(lines, m.palette.focus.Render(clip("Workspace folder", width)))
+		remaining--
+	}
+	if remaining > 0 {
+		prefix := "> "
+		inputWidth := max(width-lipgloss.Width(prefix), 1)
+		input := workspaceEditorWindow(m.workspaceDraft, m.workspaceCursor, inputWidth)
+		lines = append(lines, m.palette.muted.Render(prefix)+m.palette.text.Render(input))
+		remaining--
+	}
+	if remaining > 0 && m.workspacePending {
+		lines = append(lines, m.palette.focus.Render(clip("Validating workspace…", width)))
+		remaining--
+	} else if remaining > 0 && m.workspaceErr != nil {
+		lines = append(lines, m.palette.failure.Render(clip(m.workspaceErr.Error(), width)))
+		remaining--
+	}
+	if len(lines) >= height && height > 0 {
+		lines = lines[:height-1]
+	}
+	lines = append(lines, footer)
+	return strings.Join(lines, "\n")
+}
+
+func workspaceEditorWindow(draft string, cursor, width int) string {
+	if width <= 0 {
+		return ""
+	}
+	runes := []rune(draft)
+	cursor = min(max(cursor, 0), len(runes))
+	const cursorGlyph = "│"
+	glyphWidth := lipgloss.Width(cursorGlyph)
+	if width <= glyphWidth {
+		return cursorGlyph
+	}
+
+	// Grow the window one rune at a time, re-deriving the ellipsis budget on
+	// every step. Sizing the window before knowing whether an ellipsis is
+	// needed (as a single up-front pass would) risks reserving no room for
+	// it and overflowing width once one gets appended.
+	start, end := cursor, cursor
+	for {
+		leadingWidth, trailingWidth := 0, 0
+		if start > 0 {
+			leadingWidth = 1
+		}
+		if end < len(runes) {
+			trailingWidth = 1
+		}
+		budget := width - glyphWidth - leadingWidth - trailingWidth
+		contentWidth := lipgloss.Width(string(runes[start:end]))
+
+		if start > 0 && contentWidth+lipgloss.Width(string(runes[start-1])) <= budget {
+			start--
+			continue
+		}
+		if end < len(runes) && contentWidth+lipgloss.Width(string(runes[end])) <= budget {
+			end++
+			continue
+		}
+		break
+	}
+
+	leading, trailing := "", ""
+	if start > 0 {
+		leading = "…"
+	}
+	if end < len(runes) {
+		trailing = "…"
+	}
+
+	// Defensive clamp: only reachable at widths too small to fit a glyph
+	// plus both ellipses, which the growth loop above cannot itself resolve.
+	for lipgloss.Width(leading)+lipgloss.Width(string(runes[start:cursor]))+glyphWidth+lipgloss.Width(string(runes[cursor:end]))+lipgloss.Width(trailing) > width {
+		switch {
+		case end > cursor:
+			end--
+		case start < cursor:
+			start++
+		case trailing != "":
+			trailing = ""
+			continue
+		case leading != "":
+			leading = ""
+			continue
+		default:
+			return cursorGlyph
+		}
+		if end < len(runes) {
+			trailing = "…"
+		} else {
+			trailing = ""
+		}
+		if start > 0 {
+			leading = "…"
+		} else {
+			leading = ""
+		}
+	}
+	return leading + string(runes[start:cursor]) + cursorGlyph + string(runes[cursor:end]) + trailing
+}
+
+// renderInspection draws a read-only, live process-tree screen. Header,
+// context, optional heading, viewport, and footer share one explicit height
+// budget so even tiny terminals retain the footer as their final line.
+func (m Model) renderInspection(width, height int) string {
+	header := truncateHeaderLines(m.headerLines(width), height)
+	lines := append([]string{}, header...)
+	remaining := height - len(lines) - 1 // the inspection footer is mandatory
+	if remaining < 0 {
+		remaining = 0
+	}
+
+	context := m.inspectionContextLines(width)
+	if len(context) > remaining {
+		context = context[:remaining]
+	}
+	lines = append(lines, context...)
+	remaining -= len(context)
+
+	if width >= 110 && remaining > 0 {
+		lines = append(lines, m.palette.muted.Render(clip(inspectionHeading(), width)))
+		remaining--
+	}
+	lines = append(lines, m.renderInspectionViewport(width, remaining)...)
+	lines = append(lines, inspectionFooterLine(width))
+	return strings.Join(lines, "\n")
+}
+
+func (m Model) inspectionSession() core.Session {
+	if m.inspectionTree.Session.ID != "" {
+		return m.inspectionTree.Session
+	}
+	for _, session := range m.snapshot.Sessions {
+		if session.ID == m.inspectionSessionID {
+			return session
+		}
+	}
+	return core.Session{ID: m.inspectionSessionID, Workspace: m.snapshot.Workspace}
+}
+
+func (m Model) inspectionContextLines(width int) []string {
+	session := m.inspectionSession()
+	title := "Process Tree"
+	metadata := toolLabel(session.Tool) + " · " + trackingLabel(session.Confidence) + " · " + string(session.State)
+	firstPlain := title + "  " + metadata
+	var first string
+	if lipgloss.Width(firstPlain) > width {
+		first = m.palette.muted.Render(clip(firstPlain, width))
+	} else {
+		first = m.palette.focus.Render(title) + m.palette.muted.Render("  "+toolLabel(session.Tool)+" · "+trackingLabel(session.Confidence)+" · ") + m.stateStyle(session.State).Render(string(session.State))
+	}
+
+	workspace := session.Workspace
+	if workspace == "" {
+		workspace = m.snapshot.Workspace
+	}
+	workspacePlain := "Workspace  " + workspace
+	var second string
+	if lipgloss.Width(workspacePlain) > width {
+		second = m.palette.muted.Render(clip(workspacePlain, width))
+	} else {
+		second = m.palette.muted.Render("Workspace  ") + m.palette.text.Render(workspace)
+	}
+	return []string{first, second}
+}
+
+func inspectionHeading() string {
+	return fmt.Sprintf("%-40s %-8s %-8s %-8s %-10s %-10s", "PROCESS", "PID", "PARENT", "START", "CPU", "MEMORY")
+}
+
+func (m Model) renderInspectionViewport(width, viewportLines int) []string {
+	if viewportLines <= 0 {
+		return nil
+	}
+	rows := m.inspectionTree.Rows
+	var body []string
+
+	if m.inspectionPending && len(rows) == 0 {
+		return []string{m.palette.focus.Render(clip("Loading process tree…", width))}
+	}
+	if m.inspectionErr != nil {
+		message := "Unable to inspect: " + m.inspectionErr.Error()
+		style := m.palette.failure
+		if errors.Is(m.inspectionErr, app.ErrSessionNotFound) {
+			message = "Session unavailable — it disappeared during refresh."
+			style = m.palette.warning
+		}
+		body = append(body, style.Render(clip(message, width)))
+		if errors.Is(m.inspectionErr, app.ErrSessionNotFound) || len(rows) == 0 || len(body) >= viewportLines {
+			return body[:min(len(body), viewportLines)]
+		}
+	}
+	if len(rows) == 0 {
+		body = append(body, m.palette.muted.Render(clip("No processes remain for this session.", width)))
+		return body[:min(len(body), viewportLines)]
+	}
+
+	rowBudget := m.effectiveInspectionRowViewportLineCount(viewportLines)
+	rowsPerProcess := inspectionRowsPerProcess(width)
+	start, end, showAbove, showBelow := sessionWindow(len(rows), m.inspectionScrollOffset, rowBudget, rowsPerProcess)
+	if showAbove {
+		body = append(body, m.palette.muted.Render(clip(fmt.Sprintf("↑ %d more", start), width)))
+	}
+	for _, row := range rows[start:end] {
+		body = append(body, m.renderInspectionProcess(row, width)...)
+	}
+	if showBelow {
+		body = append(body, m.palette.muted.Render(clip(fmt.Sprintf("↓ %d more", len(rows)-end), width)))
+	}
+	if len(body) > viewportLines {
+		body = body[:viewportLines]
+	}
+	return body
+}
+
+func (m Model) renderInspectionProcess(row core.ProcessTreeRow, width int) []string {
+	process := row.Process
+	name := process.Name
+	if name == "" {
+		name = "<unnamed>"
+	}
+
+	if width >= 110 {
+		const nameWidth = 40
+		structure := inspectionStructure(row.Depth, nameWidth)
+		nameWidthRemaining := nameWidth - lipgloss.Width(structure)
+		nameCell := padDisplayWidth(name, nameWidthRemaining)
+		metadata := fmt.Sprintf(" %-8d %-8d %-8s %-10s %-10s",
+			process.PID, process.ParentPID, m.processStartLabel(process), processCPULabel(process), processMemoryLabel(process))
+		return []string{m.palette.focus.Render(structure) + m.palette.text.Render(nameCell) + m.palette.muted.Render(metadata)}
+	}
+
+	structure := inspectionStructure(row.Depth, width)
+	nameLine := func(suffix string) string {
+		nameWidth := width - lipgloss.Width(structure) - lipgloss.Width(suffix)
+		return m.palette.focus.Render(structure) + m.palette.text.Render(clip(name, nameWidth)) + m.palette.muted.Render(suffix)
+	}
+	identities := fmt.Sprintf("PID %d · PPID %d", process.PID, process.ParentPID)
+	started := "Start " + m.processStartLabel(process)
+	resources := fmt.Sprintf("CPU %s · Mem %s", processCPULabel(process), processMemoryLabel(process))
+
+	switch inspectionRowsPerProcess(width) {
+	case 2:
+		pidSuffix := fmt.Sprintf("  PID %d", process.PID)
+		metadata := fmt.Sprintf("PPID %d · %s · %s", process.ParentPID, started, resources)
+		return []string{nameLine(pidSuffix), m.palette.muted.Render(clip(metadata, width))}
+	case 3:
+		metadata := started + " · " + resources
+		return []string{nameLine(""), m.palette.muted.Render(clip(identities, width)), m.palette.muted.Render(clip(metadata, width))}
+	default:
+		return []string{
+			nameLine(""),
+			m.palette.muted.Render(clip(identities, width)),
+			m.palette.muted.Render(clip(started, width)),
+			m.palette.muted.Render(clip(resources, width)),
+		}
+	}
+}
+
+// inspectionStructure consumes coordinator-supplied Depth directly while
+// bounding its display width. The cap preserves visible topology without
+// allowing a pathological depth to crowd the process name off narrow rows.
+func inspectionStructure(depth, containerWidth int) string {
+	if depth <= 0 || containerWidth <= 0 {
+		return ""
+	}
+	const (
+		maxDepth        = 4
+		minimumNameRoom = 8
+		connectorWidth  = 3
+	)
+	visibleDepth := min(depth, maxDepth)
+	depthByWidth := (containerWidth - minimumNameRoom - connectorWidth) / 2
+	if depthByWidth < 0 {
+		depthByWidth = 0
+	}
+	visibleDepth = min(visibleDepth, depthByWidth)
+	return strings.Repeat("  ", visibleDepth) + "└─ "
+}
+
+func padDisplayWidth(value string, width int) string {
+	if width <= 0 {
+		return ""
+	}
+	value = clip(value, width)
+	return value + strings.Repeat(" ", width-lipgloss.Width(value))
+}
+
+func (m Model) processStartLabel(process core.Process) string {
+	if process.CreatedAt.IsZero() {
+		return "—"
+	}
+	return process.CreatedAt.In(m.now().Location()).Format("15:04:05")
+}
+
+func processCPULabel(process core.Process) string {
+	if !process.CPUAvailable {
+		return "—"
+	}
+	return fmt.Sprintf("%.1f%%", process.CPUPercent)
+}
+
+func processMemoryLabel(process core.Process) string {
+	return memoryLabel(core.ResourceUsage{MemoryBytes: process.MemoryBytes, MemoryAvailable: process.MemoryAvailable})
 }
 
 // renderStartupError draws the blocking startup-error screen: a

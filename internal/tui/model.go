@@ -1,7 +1,11 @@
 package tui
 
 import (
+	"errors"
+	"sort"
+	"strings"
 	"time"
+	"unicode"
 
 	tea "charm.land/bubbletea/v2"
 
@@ -14,6 +18,23 @@ const DefaultRefreshInterval = 2 * time.Second
 type Coordinator interface {
 	Start() (app.Snapshot, error)
 	Refresh() app.Snapshot
+	Inspect(string) (app.ProcessTree, error)
+	SetWorkspace(string) (app.Snapshot, error)
+	Launch(core.Tool) (app.LaunchResult, error)
+}
+
+type screenState uint8
+
+const (
+	screenDashboard screenState = iota
+	screenInspection
+	screenWorkspacePicker
+	screenWorkspaceEditor
+)
+
+type workspaceChoice struct {
+	path  string
+	other bool
 }
 
 type startupMsg struct {
@@ -22,7 +43,33 @@ type startupMsg struct {
 }
 
 type refreshMsg struct {
-	snapshot app.Snapshot
+	requestID           uint64
+	userAction          bool
+	snapshot            app.Snapshot
+	inspectionSessionID string
+	inspectionRequestID uint64
+	inspectionTree      app.ProcessTree
+	inspectionErr       error
+}
+
+type inspectMsg struct {
+	sessionID     string
+	requestID     uint64
+	loadRequestID uint64
+	tree          app.ProcessTree
+	err           error
+}
+
+type workspaceMsg struct {
+	requestID uint64
+	snapshot  app.Snapshot
+	err       error
+}
+
+type launchMsg struct {
+	requestID uint64
+	result    app.LaunchResult
+	err       error
 }
 
 type tickMsg struct {
@@ -37,12 +84,37 @@ type Model struct {
 	tick        tickFunc
 	now         func() time.Time
 
-	snapshot     app.Snapshot
-	selectedID   string
-	startupErr   error
-	started      bool
-	refreshing   bool
-	generation   uint64
+	snapshot         app.Snapshot
+	selectedID       string
+	startupErr       error
+	started          bool
+	refreshing       bool
+	generation       uint64
+	refreshRequestID uint64
+	screen           screenState
+
+	inspectionSessionID     string
+	inspectionTree          app.ProcessTree
+	inspectionErr           error
+	inspectionPending       bool
+	inspectionLoadInFlight  bool
+	inspectionLoadRequestID uint64
+	inspectionScrollOffset  int
+	inspectionRequestID     uint64
+
+	workspaceChoices     []workspaceChoice
+	workspacePickerIndex int
+	workspaceDraft       string
+	workspaceCursor      int
+	workspaceErr         error
+	workspacePending     bool
+	workspaceRequestID   uint64
+
+	actionErr       error
+	launchPending   bool
+	launchTool      core.Tool
+	launchRequestID uint64
+
 	width        int
 	height       int
 	scrollOffset int // first visible session index, measured in sessions (not lines)
@@ -81,6 +153,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.width = msg.Width
 		m.height = msg.Height
 		m.clampScrollOffset()
+		m.clampInspectionScrollOffset()
 		m.ensureSelectionVisible()
 		return m, nil
 	case startupMsg:
@@ -96,16 +169,79 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.recordCPU()
 		return m.scheduleTick()
 	case tickMsg:
-		if !m.started || m.startupErr != nil || m.refreshing || msg.generation != m.generation {
+		if !m.started || m.startupErr != nil || m.refreshing || m.launchPending || m.inspectionLoadInFlight || m.screen == screenWorkspacePicker || m.screen == screenWorkspaceEditor || msg.generation != m.generation {
 			return m, nil
 		}
-		return m.startRefresh()
+		return m.startRefresh(false)
 	case refreshMsg:
+		if msg.requestID != 0 && (!m.refreshing || msg.requestID != m.refreshRequestID) {
+			return m, nil
+		}
 		m.snapshot = msg.snapshot
 		m.refreshing = false
+		if msg.userAction && (msg.inspectionSessionID == "" || msg.inspectionErr == nil) {
+			m.actionErr = nil
+		}
+		m.reconcileSelection()
+		m.recordCPU()
+		if m.screen == screenInspection && msg.inspectionRequestID == m.inspectionRequestID && msg.inspectionSessionID == m.inspectionSessionID {
+			m.applyInspectionResult(msg.inspectionTree, msg.inspectionErr, true)
+		}
+		return m.scheduleTick()
+	case inspectMsg:
+		matchedLoad := m.inspectionLoadInFlight && msg.loadRequestID == m.inspectionLoadRequestID
+		if matchedLoad {
+			m.inspectionLoadInFlight = false
+		}
+		if m.screen != screenInspection || msg.requestID != m.inspectionRequestID || msg.sessionID != m.inspectionSessionID {
+			if matchedLoad {
+				return m.scheduleTick()
+			}
+			return m, nil
+		}
+		m.applyInspectionResult(msg.tree, msg.err, false)
+		if msg.err == nil {
+			m.actionErr = nil
+		}
+		if matchedLoad {
+			return m.scheduleTick()
+		}
+		return m, nil
+	case launchMsg:
+		if !m.launchPending || msg.requestID != m.launchRequestID {
+			return m, nil
+		}
+		m.launchPending = false
+		m.snapshot = msg.result.Snapshot
+		m.reconcileSelection()
+		if msg.result.SessionID != "" {
+			m.selectedID = msg.result.SessionID
+			m.ensureSelectionVisible()
+		}
+		m.recordCPU()
+		m.actionErr = msg.err
+		return m.scheduleTick()
+	case workspaceMsg:
+		if !m.workspacePending || msg.requestID != m.workspaceRequestID || (m.screen != screenWorkspacePicker && m.screen != screenWorkspaceEditor) {
+			return m, nil
+		}
+		m.workspacePending = false
+		if msg.err != nil {
+			m.workspaceErr = msg.err
+			return m, nil
+		}
+		m.snapshot = msg.snapshot
+		m.workspaceErr = nil
+		m.actionErr = nil
+		m.leaveWorkspaceFlow()
 		m.reconcileSelection()
 		m.recordCPU()
 		return m.scheduleTick()
+	case tea.PasteMsg:
+		if m.screen == screenWorkspaceEditor && !m.workspacePending {
+			m.insertWorkspaceText(msg.Content)
+		}
+		return m, nil
 	case tea.KeyPressMsg:
 		if msg.String() == "ctrl+c" {
 			return m, tea.Quit
@@ -113,16 +249,164 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if m.startupErr != nil {
 			return m, nil
 		}
+		if m.launchPending {
+			return m, nil
+		}
+		if m.workspacePending {
+			return m, nil
+		}
+		if m.screen == screenWorkspaceEditor {
+			switch msg.String() {
+			case "esc":
+				m.screen = screenWorkspacePicker
+				m.workspaceDraft = ""
+				m.workspaceCursor = 0
+				m.workspaceErr = nil
+			case "enter":
+				return m.startWorkspaceValidation()
+			case "left":
+				if m.workspaceCursor > 0 {
+					m.workspaceCursor--
+				}
+			case "right":
+				if m.workspaceCursor < len([]rune(m.workspaceDraft)) {
+					m.workspaceCursor++
+				}
+			case "home":
+				m.workspaceCursor = 0
+			case "end":
+				m.workspaceCursor = len([]rune(m.workspaceDraft))
+			case "backspace":
+				m.workspaceBackspace()
+			case "delete":
+				m.workspaceDelete()
+			case "ctrl+u":
+				m.workspaceDraft = ""
+				m.workspaceCursor = 0
+			default:
+				m.insertWorkspaceText(msg.Text)
+			}
+			return m, nil
+		}
+		if m.screen == screenWorkspacePicker {
+			switch msg.String() {
+			case "esc":
+				m.leaveWorkspaceFlow()
+				return m.scheduleTick()
+			case "up":
+				m.moveWorkspacePicker(-1)
+			case "down":
+				m.moveWorkspacePicker(1)
+			case "pgup":
+				m.moveWorkspacePicker(-m.workspacePickerPageSize())
+			case "pgdown":
+				m.moveWorkspacePicker(m.workspacePickerPageSize())
+			case "enter":
+				if len(m.workspaceChoices) == 0 {
+					return m, nil
+				}
+				choice := m.workspaceChoices[m.workspacePickerIndex]
+				if choice.other {
+					m.screen = screenWorkspaceEditor
+					m.workspaceDraft = ""
+					m.workspaceCursor = 0
+					m.workspaceErr = nil
+					return m, nil
+				}
+				if m.workspacePickerIndex == 0 {
+					m.leaveWorkspaceFlow()
+					return m.scheduleTick()
+				}
+				m.workspaceDraft = choice.path
+				m.workspaceCursor = len([]rune(choice.path))
+				return m.startWorkspaceValidation()
+			}
+			return m, nil
+		}
+		if m.screen == screenInspection {
+			switch msg.String() {
+			case "enter":
+				if m.inspectionPending {
+					return m, nil
+				}
+				m.leaveInspection()
+			case "esc":
+				m.leaveInspection()
+			case "r":
+				if !m.started || m.refreshing || m.inspectionPending {
+					return m, nil
+				}
+				m.generation++
+				return m.startRefresh(true)
+			case "up":
+				m.moveInspectionScroll(-1)
+			case "down":
+				m.moveInspectionScroll(1)
+			case "pgup":
+				m.moveInspectionScroll(-m.inspectionPageSize())
+			case "pgdown":
+				m.moveInspectionScroll(m.inspectionPageSize())
+			}
+			return m, nil
+		}
+		if m.inspectionLoadInFlight {
+			switch msg.String() {
+			case "enter", "r", "w", "c", "x":
+				return m, nil
+			}
+		}
 		switch msg.String() {
+		case "esc":
+			m.actionErr = nil
+		case "w":
+			if !m.started || m.refreshing {
+				return m, nil
+			}
+			m.generation++
+			m.refreshRequestID++
+			m.screen = screenWorkspacePicker
+			m.workspaceChoices = workspaceChoices(m.snapshot)
+			m.workspacePickerIndex = 0
+			return m, nil
+		case "enter":
+			if m.selectedID == "" || m.refreshing {
+				return m, nil
+			}
+			m.screen = screenInspection
+			m.inspectionSessionID = m.selectedID
+			m.inspectionTree = app.ProcessTree{}
+			m.inspectionErr = nil
+			m.inspectionPending = true
+			m.inspectionLoadInFlight = true
+			m.inspectionScrollOffset = 0
+			m.inspectionRequestID++
+			m.inspectionLoadRequestID++
+			sessionID := m.inspectionSessionID
+			requestID := m.inspectionRequestID
+			loadRequestID := m.inspectionLoadRequestID
+			return m, func() tea.Msg {
+				tree, err := m.coordinator.Inspect(sessionID)
+				return inspectMsg{sessionID: sessionID, requestID: requestID, loadRequestID: loadRequestID, tree: tree, err: err}
+			}
 		case "r":
 			if !m.started || m.refreshing {
 				return m, nil
 			}
 			m.generation++
-			return m.startRefresh()
-		case "up", "k":
+			return m.startRefresh(true)
+		case "c":
+			if !m.started || m.refreshing {
+				return m, nil
+			}
+			return m.startLaunch(core.ToolClaudeCLI)
+		case "x":
+			if !m.started || m.refreshing {
+				return m, nil
+			}
+			return m.startLaunch(core.ToolCodexCLI)
+		case "up":
 			m.moveSelection(-1)
-		case "down", "j":
+		case "down":
 			m.moveSelection(1)
 		case "pgup":
 			m.moveSelection(-m.pageSize())
@@ -135,6 +419,130 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	}
 }
 
+func workspaceChoices(snapshot app.Snapshot) []workspaceChoice {
+	choices := []workspaceChoice{{path: snapshot.Workspace}}
+	paths := make([]string, 0, len(snapshot.Sessions))
+	for _, session := range snapshot.Sessions {
+		path := session.Workspace
+		if path == "" || strings.EqualFold(path, snapshot.Workspace) {
+			continue
+		}
+		duplicate := false
+		for _, existing := range paths {
+			if strings.EqualFold(existing, path) {
+				duplicate = true
+				break
+			}
+		}
+		if !duplicate {
+			paths = append(paths, path)
+		}
+	}
+	sort.SliceStable(paths, func(i, j int) bool {
+		left := strings.ToLower(paths[i])
+		right := strings.ToLower(paths[j])
+		if left == right {
+			return paths[i] < paths[j]
+		}
+		return left < right
+	})
+	for _, path := range paths {
+		choices = append(choices, workspaceChoice{path: path})
+	}
+	return append(choices, workspaceChoice{other: true})
+}
+
+func (m *Model) leaveWorkspaceFlow() {
+	m.screen = screenDashboard
+	m.workspaceChoices = nil
+	m.workspacePickerIndex = 0
+	m.workspaceDraft = ""
+	m.workspaceCursor = 0
+	m.workspaceErr = nil
+	m.workspacePending = false
+	m.workspaceRequestID++
+}
+
+func (m Model) startWorkspaceValidation() (tea.Model, tea.Cmd) {
+	m.workspacePending = true
+	m.workspaceErr = nil
+	m.workspaceRequestID++
+	requestID := m.workspaceRequestID
+	path := m.workspaceDraft
+	return m, func() tea.Msg {
+		snapshot, err := m.coordinator.SetWorkspace(path)
+		return workspaceMsg{requestID: requestID, snapshot: snapshot, err: err}
+	}
+}
+
+func (m *Model) moveWorkspacePicker(delta int) {
+	if len(m.workspaceChoices) == 0 {
+		m.workspacePickerIndex = 0
+		return
+	}
+	m.workspacePickerIndex += delta
+	if m.workspacePickerIndex < 0 {
+		m.workspacePickerIndex = 0
+	}
+	if m.workspacePickerIndex >= len(m.workspaceChoices) {
+		m.workspacePickerIndex = len(m.workspaceChoices) - 1
+	}
+}
+
+func (m Model) workspacePickerPageSize() int {
+	height := m.height
+	if height < 1 {
+		height = 24
+	}
+	size := height - len(m.headerLineTexts(m.width)) - 2
+	if size < 1 {
+		return 1
+	}
+	return size
+}
+
+func (m *Model) insertWorkspaceText(value string) {
+	var printable []rune
+	for _, r := range value {
+		if r == '\r' || r == '\n' || unicode.IsControl(r) {
+			continue
+		}
+		printable = append(printable, r)
+	}
+	if len(printable) == 0 {
+		return
+	}
+	runes := []rune(m.workspaceDraft)
+	cursor := min(max(m.workspaceCursor, 0), len(runes))
+	updated := make([]rune, 0, len(runes)+len(printable))
+	updated = append(updated, runes[:cursor]...)
+	updated = append(updated, printable...)
+	updated = append(updated, runes[cursor:]...)
+	m.workspaceDraft = string(updated)
+	m.workspaceCursor = cursor + len(printable)
+}
+
+func (m *Model) workspaceBackspace() {
+	runes := []rune(m.workspaceDraft)
+	if m.workspaceCursor <= 0 || len(runes) == 0 {
+		return
+	}
+	cursor := min(m.workspaceCursor, len(runes))
+	runes = append(runes[:cursor-1], runes[cursor:]...)
+	m.workspaceDraft = string(runes)
+	m.workspaceCursor = cursor - 1
+}
+
+func (m *Model) workspaceDelete() {
+	runes := []rune(m.workspaceDraft)
+	cursor := min(max(m.workspaceCursor, 0), len(runes))
+	if cursor >= len(runes) {
+		return
+	}
+	runes = append(runes[:cursor], runes[cursor+1:]...)
+	m.workspaceDraft = string(runes)
+}
+
 func (m Model) scheduleTick() (tea.Model, tea.Cmd) {
 	m.generation++
 	generation := m.generation
@@ -143,11 +551,157 @@ func (m Model) scheduleTick() (tea.Model, tea.Cmd) {
 	})
 }
 
-func (m Model) startRefresh() (tea.Model, tea.Cmd) {
+func (m Model) startRefresh(userAction bool) (tea.Model, tea.Cmd) {
 	m.refreshing = true
-	return m, func() tea.Msg {
-		return refreshMsg{snapshot: m.coordinator.Refresh()}
+	m.refreshRequestID++
+	refreshID := m.refreshRequestID
+	if m.screen == screenInspection {
+		m.inspectionRequestID++
+		inspectionID := m.inspectionRequestID
+		sessionID := m.inspectionSessionID
+		return m, func() tea.Msg {
+			snapshot := m.coordinator.Refresh()
+			tree, err := m.coordinator.Inspect(sessionID)
+			return refreshMsg{
+				requestID: refreshID, userAction: userAction,
+				snapshot: snapshot, inspectionSessionID: sessionID, inspectionRequestID: inspectionID,
+				inspectionTree: tree, inspectionErr: err,
+			}
+		}
 	}
+	return m, func() tea.Msg {
+		return refreshMsg{requestID: refreshID, userAction: userAction, snapshot: m.coordinator.Refresh()}
+	}
+}
+
+func (m Model) startLaunch(tool core.Tool) (tea.Model, tea.Cmd) {
+	m.launchPending = true
+	m.launchTool = tool
+	m.launchRequestID++
+	m.generation++
+	m.refreshRequestID++
+	requestID := m.launchRequestID
+	return m, func() tea.Msg {
+		result, err := m.coordinator.Launch(tool)
+		return launchMsg{requestID: requestID, result: result, err: err}
+	}
+}
+
+func (m *Model) leaveInspection() {
+	m.inspectionRequestID++
+	m.screen = screenDashboard
+	m.inspectionSessionID = ""
+	m.inspectionTree = app.ProcessTree{}
+	m.inspectionErr = nil
+	m.inspectionPending = false
+	m.inspectionScrollOffset = 0
+}
+
+func (m *Model) applyInspectionResult(tree app.ProcessTree, err error, refreshing bool) {
+	m.inspectionPending = false
+	m.inspectionErr = err
+	switch {
+	case err == nil:
+		m.inspectionTree = tree
+	case errors.Is(err, app.ErrSessionNotFound):
+		m.inspectionTree.Rows = nil
+	case !refreshing:
+		m.inspectionTree = tree
+	}
+	m.clampInspectionScrollOffset()
+}
+
+func (m Model) inspectionPageSize() int {
+	start, end, _, _ := sessionWindow(
+		len(m.inspectionTree.Rows), m.inspectionScrollOffset,
+		m.inspectionRowViewportLineCount(), inspectionRowsPerProcess(m.width),
+	)
+	if size := end - start; size > 0 {
+		return size
+	}
+	return 1
+}
+
+func (m *Model) moveInspectionScroll(delta int) {
+	m.inspectionScrollOffset += delta
+	m.clampInspectionScrollOffset()
+}
+
+func (m *Model) clampInspectionScrollOffset() {
+	total := len(m.inspectionTree.Rows)
+	if total == 0 {
+		m.inspectionScrollOffset = 0
+		return
+	}
+	viewport := m.inspectionRowViewportLineCount()
+	rowsPerProcess := inspectionRowsPerProcess(m.width)
+	capacity := viewport / rowsPerProcess
+	maxOffset := total - 1
+	if capacity >= total {
+		maxOffset = 0
+	} else if bottomCapacity := (viewport - 1) / rowsPerProcess; bottomCapacity > 0 {
+		maxOffset = total - bottomCapacity
+	}
+	if m.inspectionScrollOffset < 0 {
+		m.inspectionScrollOffset = 0
+	}
+	if m.inspectionScrollOffset > maxOffset {
+		m.inspectionScrollOffset = maxOffset
+	}
+}
+
+func inspectionRowsPerProcess(width int) int {
+	if width < 1 {
+		width = 80
+	}
+	switch {
+	case width >= 110:
+		return 1
+	case width >= 60:
+		return 2
+	case width >= 40:
+		return 3
+	default:
+		return 4
+	}
+}
+
+func (m Model) inspectionRowViewportLineCount() int {
+	return m.effectiveInspectionRowViewportLineCount(m.inspectionViewportLineCount())
+}
+
+// effectiveInspectionRowViewportLineCount reserves the visible error line
+// that precedes a retained process tree. Page sizing, clamping, and rendering
+// all use this same budget so navigation cannot stop before the final row.
+func (m Model) effectiveInspectionRowViewportLineCount(viewportLines int) int {
+	if m.inspectionErr != nil && !errors.Is(m.inspectionErr, app.ErrSessionNotFound) && len(m.inspectionTree.Rows) > 0 {
+		viewportLines--
+	}
+	if viewportLines < 0 {
+		return 0
+	}
+	return viewportLines
+}
+
+func (m Model) inspectionViewportLineCount() int {
+	width := m.width
+	if width < 1 {
+		width = 80
+	}
+	height := m.height
+	if height < 1 {
+		height = 24
+	}
+	headerLines := len(truncateHeaderLines(m.headerLines(width), height))
+	fixedLines := headerLines + 2 + 1 // context + footer
+	if width >= 110 {
+		fixedLines++
+	}
+	viewport := height - fixedLines
+	if viewport < 0 {
+		return 0
+	}
+	return viewport
 }
 
 // recordCPU appends the total CPU usage across sessions to the sparkline

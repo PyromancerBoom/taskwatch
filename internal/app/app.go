@@ -3,14 +3,20 @@ package app
 import (
 	"errors"
 	"fmt"
+	"os"
+	"path/filepath"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
 	"taskwatch/internal/core"
 )
 
-var errCoordinatorClosed = errors.New("coordinator is closed")
+var (
+	errCoordinatorClosed = errors.New("coordinator is closed")
+	ErrSessionNotFound   = errors.New("session not found")
+)
 
 type SessionStore interface {
 	Load() ([]core.Session, error)
@@ -18,6 +24,7 @@ type SessionStore interface {
 }
 
 type Supervisor interface {
+	Launch(core.Tool, string) (core.Session, error)
 	RecoverMany([]core.Session) ([]core.Session, []error)
 	RefreshMany([]core.Session) ([]core.Session, []error)
 	Close()
@@ -39,18 +46,30 @@ type Snapshot struct {
 	RefreshedAt time.Time
 }
 
+type LaunchResult struct {
+	Snapshot  Snapshot
+	SessionID string
+}
+
+type ProcessTree struct {
+	Session core.Session
+	Rows    []core.ProcessTreeRow
+}
+
 type Coordinator struct {
-	mu         sync.Mutex
-	closed     bool
-	workspace  string
-	store      SessionStore
-	supervisor Supervisor
-	observer   Observer
-	now        func() time.Time
-	supervised []core.Session
-	observed   []core.Session
-	warnings   []Warning
-	refreshed  time.Time
+	mu               sync.Mutex
+	closed           bool
+	workspace        string
+	store            SessionStore
+	supervisor       Supervisor
+	observer         Observer
+	now              func() time.Time
+	resolveWorkspace func(string, string) (string, error)
+	supervised       []core.Session
+	observed         []core.Session
+	warnings         []Warning
+	refreshed        time.Time
+	persistenceDirty bool
 }
 
 func NewCoordinator(workspace string, store SessionStore, supervisor Supervisor, observer Observer) *Coordinator {
@@ -59,12 +78,96 @@ func NewCoordinator(workspace string, store SessionStore, supervisor Supervisor,
 
 func newCoordinator(workspace string, store SessionStore, supervisor Supervisor, observer Observer, now func() time.Time) *Coordinator {
 	return &Coordinator{
-		workspace:  workspace,
-		store:      store,
-		supervisor: supervisor,
-		observer:   observer,
-		now:        now,
+		workspace:        workspace,
+		store:            store,
+		supervisor:       supervisor,
+		observer:         observer,
+		now:              now,
+		resolveWorkspace: resolveWorkspace,
 	}
+}
+
+func (coordinator *Coordinator) SetWorkspace(path string) (Snapshot, error) {
+	coordinator.mu.Lock()
+	defer coordinator.mu.Unlock()
+	if coordinator.closed {
+		return coordinator.snapshot(), errCoordinatorClosed
+	}
+
+	path = strings.TrimSpace(path)
+	if path == "" {
+		return coordinator.snapshot(), errors.New("workspace path is empty")
+	}
+	resolved, err := coordinator.resolveWorkspace(coordinator.workspace, path)
+	if err != nil {
+		return coordinator.snapshot(), fmt.Errorf("resolve workspace: %w", err)
+	}
+	coordinator.workspace = resolved
+	return coordinator.snapshot(), nil
+}
+
+func resolveWorkspace(base, path string) (string, error) {
+	if !filepath.IsAbs(path) {
+		path = filepath.Join(base, path)
+	}
+	resolved, err := filepath.Abs(path)
+	if err != nil {
+		return "", err
+	}
+	resolved = filepath.Clean(resolved)
+	info, err := os.Stat(resolved)
+	if err != nil {
+		return "", err
+	}
+	if !info.IsDir() {
+		return "", fmt.Errorf("%q is not a directory", resolved)
+	}
+	return resolved, nil
+}
+
+func (coordinator *Coordinator) Launch(tool core.Tool) (LaunchResult, error) {
+	coordinator.mu.Lock()
+	defer coordinator.mu.Unlock()
+	if coordinator.closed {
+		return LaunchResult{Snapshot: coordinator.snapshot()}, errCoordinatorClosed
+	}
+
+	launched, err := coordinator.supervisor.Launch(tool, coordinator.workspace)
+	if err != nil {
+		return LaunchResult{Snapshot: coordinator.snapshot()}, fmt.Errorf("launch %s: %w", tool, err)
+	}
+	launched = cloneSession(launched)
+	coordinator.supervised = append(coordinator.supervised, launched)
+	coordinator.warnings = clearLaunchSaveWarnings(coordinator.warnings)
+	result := LaunchResult{Snapshot: coordinator.snapshot(), SessionID: launched.ID}
+	if err := coordinator.store.Save(cloneSessions(coordinator.persistedSessions())); err != nil {
+		coordinator.persistenceDirty = true
+		coordinator.warnings = append(coordinator.warnings, Warning{
+			SessionID: launched.ID,
+			Message:   launchSaveWarningPrefix + err.Error(),
+		})
+		result.Snapshot = coordinator.snapshot()
+		return result, fmt.Errorf("save launched session %q: %w", launched.ID, err)
+	}
+	coordinator.persistenceDirty = false
+	return result, nil
+}
+
+const launchSaveWarningPrefix = "save launched session: "
+
+// clearLaunchSaveWarnings drops prior "session started but could not be
+// saved" warnings. A successful Launch always retries the complete
+// supervised-session set, so any earlier such warning is now stale
+// regardless of the outcome of this launch's own save attempt.
+func clearLaunchSaveWarnings(warnings []Warning) []Warning {
+	filtered := make([]Warning, 0, len(warnings))
+	for _, w := range warnings {
+		if strings.HasPrefix(w.Message, launchSaveWarningPrefix) {
+			continue
+		}
+		filtered = append(filtered, w)
+	}
+	return filtered
 }
 
 func (coordinator *Coordinator) Start() (Snapshot, error) {
@@ -179,13 +282,50 @@ func (coordinator *Coordinator) Refresh() Snapshot {
 		coordinator.observed = cloneSessions(observed)
 	}
 
-	if newlyExited {
+	if newlyExited || coordinator.persistenceDirty {
 		if err := coordinator.store.Save(cloneSessions(coordinator.persistedSessions())); err != nil {
+			coordinator.persistenceDirty = true
 			coordinator.warnings = append(coordinator.warnings, Warning{Message: fmt.Sprintf("save reconciled sessions: %v", err)})
+		} else {
+			coordinator.persistenceDirty = false
 		}
 	}
 	coordinator.refreshed = coordinator.now()
 	return coordinator.snapshot()
+}
+
+// Inspect returns a process forest prepared from a cached session snapshot.
+func (coordinator *Coordinator) Inspect(sessionID string) (ProcessTree, error) {
+	coordinator.mu.Lock()
+	defer coordinator.mu.Unlock()
+	if coordinator.closed {
+		return ProcessTree{}, errCoordinatorClosed
+	}
+
+	var found *core.Session
+	for i := range coordinator.supervised {
+		if coordinator.supervised[i].ID == sessionID {
+			found = &coordinator.supervised[i]
+			break
+		}
+	}
+	if found == nil {
+		for i := range coordinator.observed {
+			if coordinator.observed[i].ID == sessionID {
+				found = &coordinator.observed[i]
+				break
+			}
+		}
+	}
+	if found == nil {
+		return ProcessTree{}, ErrSessionNotFound
+	}
+
+	session := cloneSession(*found)
+	return ProcessTree{
+		Session: session,
+		Rows:    core.CollectProcessForest(session.Processes),
+	}, nil
 }
 
 func (coordinator *Coordinator) Close() {
