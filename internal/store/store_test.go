@@ -111,3 +111,62 @@ func TestLoadKeepsMetadataForJobRecoveryWithoutALiveRootSnapshot(t *testing.T) {
 		t.Fatalf("Load() = %#v, want metadata retained for named-job recovery", got)
 	}
 }
+
+func TestSaveAndLoadWorkspacesRoundTrip(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "nested", "workspaces.json")
+	recent := []string{`C:\work\taskwatch`, `C:\work\website`, `D:\scratch`}
+
+	if err := SaveWorkspaces(path, recent); err != nil {
+		t.Fatalf("SaveWorkspaces() error = %v", err)
+	}
+	got, err := LoadWorkspaces(path)
+	if err != nil {
+		t.Fatalf("LoadWorkspaces() error = %v", err)
+	}
+	if strings.Join(got, "|") != strings.Join(recent, "|") {
+		t.Fatalf("LoadWorkspaces() = %#v, want %#v", got, recent)
+	}
+
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("ReadFile() error = %v", err)
+	}
+	if !strings.Contains(string(raw), `"schema_version": 1`) {
+		t.Fatalf("saved JSON does not declare schema version 1: %s", raw)
+	}
+}
+
+func TestSaveWorkspacesEmptyListRoundTrips(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "workspaces.json")
+	if err := SaveWorkspaces(path, nil); err != nil {
+		t.Fatalf("SaveWorkspaces(nil) error = %v", err)
+	}
+	got, err := LoadWorkspaces(path)
+	if err != nil {
+		t.Fatalf("LoadWorkspaces() error = %v", err)
+	}
+	if len(got) != 0 {
+		t.Fatalf("LoadWorkspaces() = %#v, want empty", got)
+	}
+}
+
+func TestLoadWorkspacesMissingFileReturnsEmpty(t *testing.T) {
+	got, err := LoadWorkspaces(filepath.Join(t.TempDir(), "missing.json"))
+	if err != nil {
+		t.Fatalf("LoadWorkspaces() error = %v", err)
+	}
+	if len(got) != 0 {
+		t.Fatalf("LoadWorkspaces() = %#v, want empty", got)
+	}
+}
+
+func TestLoadWorkspacesRejectsUnsupportedSchema(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "workspaces.json")
+	if err := os.WriteFile(path, []byte(`{"schema_version":2,"recent_workspaces":[]}`), 0o600); err != nil {
+		t.Fatalf("WriteFile() error = %v", err)
+	}
+
+	if _, err := LoadWorkspaces(path); err == nil {
+		t.Fatal("LoadWorkspaces() accepted unsupported schema version")
+	}
+}

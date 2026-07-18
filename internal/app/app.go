@@ -21,6 +21,8 @@ var (
 type SessionStore interface {
 	Load() ([]core.Session, error)
 	Save([]core.Session) error
+	LoadRecentWorkspaces() ([]string, error)
+	SaveRecentWorkspaces([]string) error
 }
 
 type Supervisor interface {
@@ -39,6 +41,7 @@ type warningKind uint8
 const (
 	warningGeneral warningKind = iota
 	warningPersistence
+	warningRecentWorkspaces
 )
 
 type Warning struct {
@@ -48,10 +51,11 @@ type Warning struct {
 }
 
 type Snapshot struct {
-	Workspace   string
-	Sessions    []core.Session
-	Warnings    []Warning
-	RefreshedAt time.Time
+	CurrentDir       string
+	RecentWorkspaces []string
+	Sessions         []core.Session
+	Warnings         []Warning
+	RefreshedAt      time.Time
 }
 
 type LaunchResult struct {
@@ -67,7 +71,7 @@ type ProcessTree struct {
 type Coordinator struct {
 	mu               sync.Mutex
 	closed           bool
-	workspace        string
+	baseDir          string
 	store            SessionStore
 	supervisor       Supervisor
 	observer         Observer
@@ -75,18 +79,22 @@ type Coordinator struct {
 	resolveWorkspace func(string, string) (string, error)
 	supervised       []core.Session
 	observed         []core.Session
+	recentWorkspaces []string
 	warnings         []Warning
 	refreshed        time.Time
 	persistenceDirty bool
 }
 
-func NewCoordinator(workspace string, store SessionStore, supervisor Supervisor, observer Observer) *Coordinator {
-	return newCoordinator(workspace, store, supervisor, observer, time.Now)
+// maxRecentWorkspaces caps the persisted recent-workspaces list.
+const maxRecentWorkspaces = 8
+
+func NewCoordinator(baseDir string, store SessionStore, supervisor Supervisor, observer Observer) *Coordinator {
+	return newCoordinator(baseDir, store, supervisor, observer, time.Now)
 }
 
-func newCoordinator(workspace string, store SessionStore, supervisor Supervisor, observer Observer, now func() time.Time) *Coordinator {
+func newCoordinator(baseDir string, store SessionStore, supervisor Supervisor, observer Observer, now func() time.Time) *Coordinator {
 	return &Coordinator{
-		workspace:        workspace,
+		baseDir:          baseDir,
 		store:            store,
 		supervisor:       supervisor,
 		observer:         observer,
@@ -95,23 +103,22 @@ func newCoordinator(workspace string, store SessionStore, supervisor Supervisor,
 	}
 }
 
-func (coordinator *Coordinator) SetWorkspace(path string) (Snapshot, error) {
-	coordinator.mu.Lock()
-	defer coordinator.mu.Unlock()
-	if coordinator.closed {
-		return coordinator.snapshot(), errCoordinatorClosed
+// recordRecentWorkspace moves path to the front of the recent list, deduping
+// case-insensitively and capping the list length. The most recently launched
+// workspace is always first, so the picker can pre-select it.
+func (coordinator *Coordinator) recordRecentWorkspace(path string) {
+	updated := make([]string, 0, len(coordinator.recentWorkspaces)+1)
+	updated = append(updated, path)
+	for _, existing := range coordinator.recentWorkspaces {
+		if strings.EqualFold(existing, path) {
+			continue
+		}
+		updated = append(updated, existing)
 	}
-
-	path = strings.TrimSpace(path)
-	if path == "" {
-		return coordinator.snapshot(), errors.New("workspace path is empty")
+	if len(updated) > maxRecentWorkspaces {
+		updated = updated[:maxRecentWorkspaces]
 	}
-	resolved, err := coordinator.resolveWorkspace(coordinator.workspace, path)
-	if err != nil {
-		return coordinator.snapshot(), fmt.Errorf("resolve workspace: %w", err)
-	}
-	coordinator.workspace = resolved
-	return coordinator.snapshot(), nil
+	coordinator.recentWorkspaces = updated
 }
 
 func resolveWorkspace(base, path string) (string, error) {
@@ -133,20 +140,34 @@ func resolveWorkspace(base, path string) (string, error) {
 	return resolved, nil
 }
 
-func (coordinator *Coordinator) Launch(tool core.Tool) (LaunchResult, error) {
+func (coordinator *Coordinator) Launch(tool core.Tool, workspace string) (LaunchResult, error) {
 	coordinator.mu.Lock()
 	defer coordinator.mu.Unlock()
 	if coordinator.closed {
 		return LaunchResult{Snapshot: coordinator.snapshot()}, errCoordinatorClosed
 	}
 
-	launched, err := coordinator.supervisor.Launch(tool, coordinator.workspace)
+	workspace = strings.TrimSpace(workspace)
+	if workspace == "" {
+		return LaunchResult{Snapshot: coordinator.snapshot()}, errors.New("workspace path is empty")
+	}
+	resolved, err := coordinator.resolveWorkspace(coordinator.baseDir, workspace)
+	if err != nil {
+		return LaunchResult{Snapshot: coordinator.snapshot()}, fmt.Errorf("resolve workspace: %w", err)
+	}
+
+	launched, err := coordinator.supervisor.Launch(tool, resolved)
 	if err != nil {
 		return LaunchResult{Snapshot: coordinator.snapshot()}, fmt.Errorf("launch %s: %w", tool, err)
 	}
 	launched = cloneSession(launched)
 	coordinator.supervised = append(coordinator.supervised, launched)
 	coordinator.warnings = clearPersistenceWarnings(coordinator.warnings)
+	coordinator.recordRecentWorkspace(resolved)
+	coordinator.warnings = clearWarningKind(coordinator.warnings, warningRecentWorkspaces)
+	if err := coordinator.store.SaveRecentWorkspaces(append([]string(nil), coordinator.recentWorkspaces...)); err != nil {
+		coordinator.warnings = append(coordinator.warnings, Warning{Message: fmt.Sprintf("save recent workspaces: %v", err), kind: warningRecentWorkspaces})
+	}
 	result := LaunchResult{Snapshot: coordinator.snapshot(), SessionID: launched.ID}
 	if err := coordinator.store.Save(cloneSessions(coordinator.persistedSessions())); err != nil {
 		coordinator.persistenceDirty = true
@@ -170,9 +191,13 @@ const launchSaveWarningPrefix = "save launched session: "
 // earlier persistence-category warning stale, regardless of which method
 // produced it.
 func clearPersistenceWarnings(warnings []Warning) []Warning {
+	return clearWarningKind(warnings, warningPersistence)
+}
+
+func clearWarningKind(warnings []Warning, kind warningKind) []Warning {
 	filtered := make([]Warning, 0, len(warnings))
 	for _, w := range warnings {
-		if w.kind == warningPersistence {
+		if w.kind == kind {
 			continue
 		}
 		filtered = append(filtered, w)
@@ -196,6 +221,15 @@ func (coordinator *Coordinator) Start() (Snapshot, error) {
 	coordinator.supervised = nil
 	coordinator.observed = nil
 	coordinator.warnings = nil
+
+	recent, recentErr := coordinator.store.LoadRecentWorkspaces()
+	if recentErr != nil {
+		coordinator.recentWorkspaces = nil
+		coordinator.warnings = append(coordinator.warnings, Warning{Message: fmt.Sprintf("load recent workspaces: %v", recentErr), kind: warningRecentWorkspaces})
+	} else {
+		coordinator.recentWorkspaces = recent
+	}
+
 	exited := false
 	if len(loaded) > 0 {
 		recovered, recoverErrs := coordinator.supervisor.RecoverMany(cloneSessions(loaded))
@@ -380,10 +414,11 @@ func (coordinator *Coordinator) snapshot() Snapshot {
 		return sessions[i].StartedAt.Before(sessions[j].StartedAt)
 	})
 	return Snapshot{
-		Workspace:   coordinator.workspace,
-		Sessions:    sessions,
-		Warnings:    append([]Warning(nil), coordinator.warnings...),
-		RefreshedAt: coordinator.refreshed,
+		CurrentDir:       coordinator.baseDir,
+		RecentWorkspaces: append([]string(nil), coordinator.recentWorkspaces...),
+		Sessions:         sessions,
+		Warnings:         append([]Warning(nil), coordinator.warnings...),
+		RefreshedAt:      coordinator.refreshed,
 	}
 }
 

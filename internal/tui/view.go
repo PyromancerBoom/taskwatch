@@ -25,9 +25,9 @@ const minimumTerminalWidth = 25
 // planLayout). This trades footer wrapping for legibility of the key hints at
 // every width, including the narrowest supported one.
 var footerHints = []string{
-	"Enter inspect • w workspace • c/x launch • r refresh • ↑/↓ move • Ctrl+C close",
-	"Enter inspect • w • c/x • r • ↑↓ • ^C",
-	"Enter w c/x r ↑↓ ^C",
+	"Enter inspect • c/x launch • r refresh • ↑/↓ move • Ctrl+C close",
+	"Enter inspect • c/x • r • ↑↓ • ^C",
+	"Enter c/x r ↑↓ ^C",
 }
 
 var inspectionFooterHints = []string{
@@ -37,21 +37,21 @@ var inspectionFooterHints = []string{
 }
 
 var workspacePickerFooterHints = []string{
-	"↑/↓ move  •  PgUp/PgDn page  •  Enter select  •  Esc back  •  Ctrl+C close",
-	"↑/↓ • PgUp/PgDn • Enter select • Esc back • ^C close",
+	"↑/↓ move  •  PgUp/PgDn page  •  Enter launch here  •  Esc back  •  Ctrl+C close",
+	"↑/↓ • PgUp/PgDn • Enter launch • Esc back • ^C close",
 	"↑↓ • Enter • Esc • ^C",
 }
 
 var workspaceEditorFooterHints = []string{
-	"Enter apply  •  Esc back  •  Ctrl+C close",
-	"Enter apply • Esc back • ^C close",
+	"Enter launch here  •  Esc back  •  Ctrl+C close",
+	"Enter launch • Esc back • ^C close",
 	"Enter • Esc • ^C",
 }
 
 var workspacePendingFooterHints = []string{
-	"Validating workspace…  •  Ctrl+C close",
-	"Validating… • ^C close",
-	"Validating… • ^C",
+	"Launching…  •  Ctrl+C close",
+	"Launching… • ^C close",
+	"Launching… • ^C",
 }
 
 // footerLine picks the widest footer hint that fits on one line, falling back
@@ -167,28 +167,26 @@ func (m Model) statusChipStyle() lipgloss.Style {
 // segment) and the model's viewport bookkeeping (which only needs the line
 // count), so both agree on how many lines the header actually costs.
 //
-// The brand chip, workspace, and status are kept on one line when they fit;
-// otherwise the header drops to two lines (brand+workspace, then status) so
-// the status time and workspace both stay discoverable at narrow widths
-// instead of one of them being silently clipped away.
+// The header carries only the brand chip and the status: there is no global
+// "active workspace" anymore — a workspace is chosen per launch — so nothing
+// in the header implies a mutable launch target. The brand and status share
+// one line when they fit; otherwise they drop to two lines.
 func (m Model) headerLineTexts(width int) []string {
 	chip := " " + brand + " "
-	workspace := m.snapshot.Workspace
 	status := m.statusChipText()
 
-	oneLine := chip + "  " + workspace + "  " + status
+	oneLine := chip + "  " + status
 	if lipgloss.Width(oneLine) <= width {
 		return []string{oneLine}
 	}
-	return []string{chip + "  " + workspace, status}
+	return []string{chip, status}
 }
 
-// headerLines renders the styled header: the brand as a colored chip, the
-// workspace in default text, and the status as a colored chip (healthy when
-// idle, focus-colored while refreshing). Plain text is measured and clipped
-// before any style is applied, per clip()'s ANSI-safety constraint; a line
-// that still doesn't fit after clipping its components falls back to a
-// muted, fully clipped plain line.
+// headerLines renders the styled header: the brand as a colored chip and the
+// status as a colored chip (healthy when idle, focus-colored while
+// refreshing). Plain text is measured and clipped before any style is
+// applied, per clip()'s ANSI-safety constraint; a line that still doesn't fit
+// after clipping falls back to a muted, fully clipped plain line.
 func (m Model) headerLines(width int) []string {
 	chipPlain := " " + brand + " "
 	statusPlain := m.statusChipText()
@@ -196,22 +194,14 @@ func (m Model) headerLines(width int) []string {
 
 	renderLine := func(plainLine string, includeChip, includeStatus bool) string {
 		if lipgloss.Width(plainLine) > width {
-			if includeChip && !includeStatus {
-				visibleChip := clip(chipPlain, width)
-				remaining := width - lipgloss.Width(visibleChip)
-				workspaceTail := clip("  "+m.snapshot.Workspace, remaining)
-				return m.palette.brand.Render(visibleChip) + m.palette.text.Render(workspaceTail)
-			}
 			return m.palette.muted.Render(clip(plainLine, width))
 		}
 		if includeChip && includeStatus {
-			// One-line layout: chip + "  " + workspace + "  " + status.
-			workspace := m.snapshot.Workspace
-			return m.palette.brand.Render(chipPlain) + m.palette.text.Render("  "+workspace+"  ") + statusStyle.Render(statusPlain)
+			// One-line layout: chip + "  " + status.
+			return m.palette.brand.Render(chipPlain) + m.palette.text.Render("  ") + statusStyle.Render(statusPlain)
 		}
 		if includeChip {
-			workspace := m.snapshot.Workspace
-			return m.palette.brand.Render(chipPlain) + m.palette.text.Render("  "+workspace)
+			return m.palette.brand.Render(chipPlain)
 		}
 		return statusStyle.Render(statusPlain)
 	}
@@ -496,7 +486,7 @@ func (m Model) render() string {
 func (m Model) renderWorkspacePicker(width, height int) string {
 	header := truncateHeaderLines(m.headerLines(width), height)
 	footer := workspacePickerFooterLine(width)
-	if m.workspacePending {
+	if m.launchPending {
 		footer = workspaceEditorFooterLine(width, true)
 	}
 	lines := append([]string{}, header...)
@@ -505,12 +495,13 @@ func (m Model) renderWorkspacePicker(width, height int) string {
 		remaining = 0
 	}
 	if remaining > 0 {
-		lines = append(lines, m.palette.focus.Render(clip("Choose workspace", width)))
+		title := "Launch " + toolLabel(m.launchTool) + " · choose workspace"
+		lines = append(lines, m.palette.focus.Render(clip(title, width)))
 		remaining--
 	}
 
 	statusLines := 0
-	if m.workspacePending || m.workspaceErr != nil {
+	if m.launchPending || m.workspaceErr != nil {
 		statusLines = 1
 	}
 	choiceLines := max(remaining-statusLines, 0)
@@ -522,9 +513,9 @@ func (m Model) renderWorkspacePicker(width, height int) string {
 		choice := m.workspaceChoices[index]
 		label := choice.path
 		if choice.other {
-			label = "Enter another folder…"
-		} else if index == 0 {
-			label += "  [active]"
+			label = "Enter a different folder…"
+		} else if choice.label != "" {
+			label += "  (" + choice.label + ")"
 		}
 		prefix := "  "
 		style := m.palette.text
@@ -537,10 +528,10 @@ func (m Model) renderWorkspacePicker(width, height int) string {
 	if showBelow {
 		lines = append(lines, m.palette.muted.Render(clip(fmt.Sprintf("↓ %d more", len(m.workspaceChoices)-end), width)))
 	}
-	if m.workspacePending && len(lines) < height-1 {
-		lines = append(lines, m.palette.focus.Render(clip("Validating workspace…", width)))
+	if m.launchPending && len(lines) < height-1 {
+		lines = append(lines, m.palette.focus.Render(clip("Launching…", width)))
 	} else if m.workspaceErr != nil && len(lines) < height-1 {
-		message := "Unable to use workspace: " + m.workspaceErr.Error()
+		message := "Unable to launch: " + m.workspaceErr.Error()
 		lines = append(lines, m.palette.failure.Render(clip(message, width)))
 	}
 	if len(lines) >= height && height > 0 {
@@ -552,14 +543,15 @@ func (m Model) renderWorkspacePicker(width, height int) string {
 
 func (m Model) renderWorkspaceEditor(width, height int) string {
 	header := truncateHeaderLines(m.headerLines(width), height)
-	footer := workspaceEditorFooterLine(width, m.workspacePending)
+	footer := workspaceEditorFooterLine(width, m.launchPending)
 	lines := append([]string{}, header...)
 	remaining := height - len(lines) - 1
 	if remaining < 0 {
 		remaining = 0
 	}
 	if remaining > 0 {
-		lines = append(lines, m.palette.focus.Render(clip("Workspace folder", width)))
+		title := "Launch " + toolLabel(m.launchTool) + " in folder"
+		lines = append(lines, m.palette.focus.Render(clip(title, width)))
 		remaining--
 	}
 	if remaining > 0 {
@@ -569,8 +561,8 @@ func (m Model) renderWorkspaceEditor(width, height int) string {
 		lines = append(lines, m.palette.muted.Render(prefix)+m.palette.text.Render(input))
 		remaining--
 	}
-	if remaining > 0 && m.workspacePending {
-		lines = append(lines, m.palette.focus.Render(clip("Validating workspace…", width)))
+	if remaining > 0 && m.launchPending {
+		lines = append(lines, m.palette.focus.Render(clip("Launching…", width)))
 		remaining--
 	} else if remaining > 0 && m.workspaceErr != nil {
 		lines = append(lines, m.palette.failure.Render(clip(m.workspaceErr.Error(), width)))
@@ -697,7 +689,7 @@ func (m Model) inspectionSession() core.Session {
 			return session
 		}
 	}
-	return core.Session{ID: m.inspectionSessionID, Workspace: m.snapshot.Workspace}
+	return core.Session{ID: m.inspectionSessionID}
 }
 
 func (m Model) inspectionContextLines(width int) []string {
@@ -712,10 +704,7 @@ func (m Model) inspectionContextLines(width int) []string {
 		first = m.palette.focus.Render(title) + m.palette.muted.Render("  "+toolLabel(session.Tool)+" · "+trackingLabel(session.Confidence)+" · ") + m.stateStyle(session.State).Render(string(session.State))
 	}
 
-	workspace := session.Workspace
-	if workspace == "" {
-		workspace = m.snapshot.Workspace
-	}
+	workspace := folder(session)
 	workspacePlain := "Workspace  " + workspace
 	var second string
 	if lipgloss.Width(workspacePlain) > width {

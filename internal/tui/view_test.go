@@ -21,7 +21,7 @@ func testModel(width int, sessions []core.Session) Model {
 	model.started = true
 	model.now = func() time.Time { return viewNow }
 	model.snapshot = app.Snapshot{
-		Workspace:   `C:\repo\taskwatch`,
+		CurrentDir:  `C:\repo\taskwatch`,
 		Sessions:    sessions,
 		RefreshedAt: viewNow,
 	}
@@ -52,10 +52,10 @@ func detailedSession() core.Session {
 func TestFullRenderingShowsHeaderEveryColumnAndFooter(t *testing.T) {
 	content := testModel(130, []core.Session{detailedSession()}).View().Content
 	for _, want := range []string{
-		"TASKWATCH", `C:\repo\taskwatch`, "● LIVE · 03:04:05",
+		"TASKWATCH", "● LIVE · 03:04:05",
 		"APP", "TRACKING", "STATUS", "PROCESSES", "CPU", "MEMORY", "AGE", "FOLDER",
 		"Codex CLI", "managed", "running", "2", "12.3%", "1.5 MB", "2h", `C:\repo`,
-		"Enter inspect", "w workspace", "c/x launch", "r refresh", "↑/↓ move", "Ctrl+C close",
+		"Enter inspect", "c/x launch", "r refresh", "↑/↓ move", "Ctrl+C close",
 	} {
 		if !strings.Contains(content, want) {
 			t.Errorf("full view missing %q:\n%s", want, content)
@@ -77,7 +77,7 @@ func TestDashboardFooterAdvertisesOnlyScopedActionsAcrossWidths(t *testing.T) {
 			if got != footerLine(width) {
 				t.Fatalf("footer = %q, want %q", got, footerLine(width))
 			}
-			for _, want := range []string{"Enter", "w", "c/x", "r", "↑"} {
+			for _, want := range []string{"Enter", "c/x", "r", "↑"} {
 				if !strings.Contains(got, want) {
 					t.Fatalf("width %d footer missing %q: %q", width, want, got)
 				}
@@ -113,7 +113,7 @@ func TestRenderingNeverOverflowsWidthsAtLeastForty(t *testing.T) {
 	session.Workspace = `C:\a very long workspace folder\with\many\nested\segments\that must truncate safely`
 	for _, width := range []int{40, 55, 79, 80, 109, 110, 130} {
 		model := testModel(width, []core.Session{session})
-		model.snapshot.Workspace = session.Workspace
+		model.snapshot.CurrentDir = session.Workspace
 		assertWithinWidth(t, model.View().Content, width)
 	}
 }
@@ -225,19 +225,14 @@ func isBorderRule(s string) bool {
 	return true
 }
 
-// TestNarrowHeaderKeepsWorkspaceAndStatusDiscoverable was adapted for the
-// brand-chip/status-chip header: at very narrow widths with a long unbroken
-// workspace path, the header now clips (rather than wraps) the workspace so
-// the status chip and its refresh time stay on their own line instead of
-// being pushed out. Both the workspace's recognizable prefix and the refresh
-// time remain visible, satisfying "discoverable" even though the full
-// unbroken path is not guaranteed at width 40 (see TestNarrowStartupErrorWrapsWithoutLosingLongPath
-// for the case where the full text must survive).
-func TestNarrowHeaderKeepsWorkspaceAndStatusDiscoverable(t *testing.T) {
+// TestNarrowHeaderKeepsBrandAndStatusDiscoverable checks that the
+// brand-chip/status-chip header keeps both the brand and the status (with its
+// refresh time) visible at a narrow width. The header no longer carries a
+// workspace — a workspace is chosen per launch — so nothing there implies a
+// mutable launch target.
+func TestNarrowHeaderKeepsBrandAndStatusDiscoverable(t *testing.T) {
 	const width = 40
-	workspace := `C:\Users\someone\source\repos\workspace-with-a-very-long-unbroken-name\taskwatch`
 	model := testModel(width, nil)
-	model.snapshot.Workspace = workspace
 	content := model.View().Content
 
 	assertWithinWidth(t, content, width)
@@ -247,9 +242,6 @@ func TestNarrowHeaderKeepsWorkspaceAndStatusDiscoverable(t *testing.T) {
 	}
 	if styledBrand := model.palette.brand.Render(" " + brand + " "); !strings.Contains(content, styledBrand) {
 		t.Fatalf("width-%d header lost brand chip styling:\n%s", width, content)
-	}
-	if !strings.Contains(plain, `C:\Users\someone`) {
-		t.Fatalf("width-%d header lost workspace prefix:\n%s", width, content)
 	}
 	if !strings.Contains(plain, "LIVE") || !strings.Contains(plain, "03:04:05") {
 		t.Fatalf("width-%d header lost status/refresh time:\n%s", width, content)
@@ -788,6 +780,22 @@ func inspectionTreeWithRows(rows []core.ProcessTreeRow) app.ProcessTree {
 	return app.ProcessTree{Session: session, Rows: rows}
 }
 
+func TestInspectionShowsUnknownInsteadOfCurrentDirWhenSessionWorkspaceIsMissing(t *testing.T) {
+	session := detailedSession()
+	session.ID = "unknown-workspace"
+	session.Workspace = ""
+	model := inspectionTestModel(80, 12, app.ProcessTree{Session: session}, nil, false)
+	model.snapshot.CurrentDir = `C:\unrelated-taskwatch-directory`
+
+	plain := flattenRendered(model.View().Content)
+	if strings.Contains(plain, model.snapshot.CurrentDir) {
+		t.Fatalf("inspection substituted CurrentDir for an unknown session workspace:\n%s", model.View().Content)
+	}
+	if !strings.Contains(plain, "Workspace  —") {
+		t.Fatalf("inspection did not render an unknown workspace marker:\n%s", model.View().Content)
+	}
+}
+
 func TestInspectionWideAndNarrowViewsShowContextAndProcessFields(t *testing.T) {
 	created := time.Date(2026, 7, 15, 1, 2, 3, 0, time.UTC)
 	tree := inspectionTreeWithRows([]core.ProcessTreeRow{{
@@ -946,18 +954,19 @@ func TestInspectionFooterAdvertisesOnlyReadOnlyInspectionKeys(t *testing.T) {
 	}
 }
 
-func TestWorkspacePickerViewShowsOrderedChoicesActiveMarkerAndScopedFooter(t *testing.T) {
+func TestWorkspacePickerViewShowsOrderedChoicesCurrentDirMarkerAndScopedFooter(t *testing.T) {
 	model := testModel(90, []core.Session{
 		{ID: "z", Workspace: `C:\zeta`},
 		{ID: "a", Workspace: `C:\alpha`},
 	})
 	model.height = 12
 	model.screen = screenWorkspacePicker
+	model.launchTool = core.ToolClaudeCLI
 	model.workspaceChoices = workspaceChoices(model.snapshot)
 	content := model.View().Content
 	plain := flattenRendered(content)
 
-	for _, want := range []string{"Choose workspace", `C:\repo\taskwatch`, "active", `C:\alpha`, `C:\zeta`, "Enter another folder…", "PgUp/PgDn", "Enter select", "Esc back", "Ctrl+C"} {
+	for _, want := range []string{"Launch Claude", "choose workspace", `C:\repo\taskwatch`, "current dir", `C:\alpha`, `C:\zeta`, "Enter a different folder…", "PgUp/PgDn", "Enter launch", "Esc back", "Ctrl+C"} {
 		if !strings.Contains(plain, want) {
 			t.Fatalf("workspace picker missing %q:\n%s", want, content)
 		}
@@ -976,13 +985,14 @@ func TestWorkspaceEditorRendersVisibleCursorAndHorizontallyWindowsLongDraft(t *t
 	model := testModel(25, nil)
 	model.height = 8
 	model.screen = screenWorkspaceEditor
+	model.launchTool = core.ToolClaudeCLI
 	model.workspaceDraft = `C:\a-very-long-parent\nested\kq-final`
 	model.workspaceCursor = len([]rune(model.workspaceDraft))
 	content := model.View().Content
 	plain := flattenRendered(content)
 
 	assertWithinWidth(t, content, model.width)
-	if !strings.Contains(plain, "Workspace folder") || !strings.Contains(plain, "│") {
+	if !strings.Contains(plain, "folder") || !strings.Contains(plain, "│") {
 		t.Fatalf("workspace editor missing label/cursor:\n%s", content)
 	}
 	if !strings.Contains(plain, "kq-final") || strings.Contains(plain, "a-very-long-parent") {
@@ -1035,13 +1045,13 @@ func TestWorkspaceEditorShowsInlineFailureAndPendingStatus(t *testing.T) {
 		t.Fatalf("workspace editor lost inline failure/draft:\n%s", model.View().Content)
 	}
 
-	model.workspacePending = true
+	model.launchPending = true
 	pendingContent := model.View().Content
 	pendingPlain := flattenRendered(pendingContent)
-	if !strings.Contains(pendingPlain, "Validating workspace") || !strings.Contains(pendingPlain, "Ctrl+C") {
+	if !strings.Contains(pendingPlain, "Launching") || !strings.Contains(pendingPlain, "Ctrl+C") {
 		t.Fatalf("workspace editor missing pending status:\n%s", pendingContent)
 	}
-	for _, forbidden := range []string{"Enter apply", "Esc back"} {
+	for _, forbidden := range []string{"Enter launch", "Esc back"} {
 		if strings.Contains(pendingPlain, forbidden) {
 			t.Fatalf("pending editor advertises %q:\n%s", forbidden, pendingContent)
 		}
@@ -1052,17 +1062,18 @@ func TestWorkspacePickerShowsKnownPathValidationStatusAndInlineFailure(t *testin
 	model := testModel(60, []core.Session{{ID: "known", Workspace: `C:\known`}})
 	model.height = 10
 	model.screen = screenWorkspacePicker
+	model.launchTool = core.ToolClaudeCLI
 	model.workspaceChoices = workspaceChoices(model.snapshot)
 	model.workspacePickerIndex = 1
 	model.workspaceDraft = `C:\known`
-	model.workspacePending = true
+	model.launchPending = true
 
 	pending := flattenRendered(model.View().Content)
-	if !strings.Contains(pending, "Validating workspace") || !strings.Contains(pending, `C:\known`) {
+	if !strings.Contains(pending, "Launching") || !strings.Contains(pending, `C:\known`) {
 		t.Fatalf("known workspace pending state missing:\n%s", model.View().Content)
 	}
 
-	model.workspacePending = false
+	model.launchPending = false
 	model.workspaceErr = errors.New("access denied")
 	failed := flattenRendered(model.View().Content)
 	if !strings.Contains(failed, "access denied") || !strings.Contains(failed, `C:\known`) {

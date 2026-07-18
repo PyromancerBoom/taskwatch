@@ -59,13 +59,23 @@ func Save(path string, sessions []core.Session) error {
 	}
 	payload = append(payload, '\n')
 
+	if err := atomicWrite(path, payload); err != nil {
+		return fmt.Errorf("persist session store: %w", err)
+	}
+	return nil
+}
+
+// atomicWrite replaces path with payload through a temporary file, a flush,
+// and an atomic rename, creating the parent directory when needed. The
+// temporary file is secured to 0600 before any data is written.
+func atomicWrite(path string, payload []byte) error {
 	dir := filepath.Dir(path)
 	if err := os.MkdirAll(dir, 0o700); err != nil {
-		return fmt.Errorf("create session store directory: %w", err)
+		return fmt.Errorf("create store directory: %w", err)
 	}
 	temporary, err := os.CreateTemp(dir, "."+filepath.Base(path)+".tmp-*")
 	if err != nil {
-		return fmt.Errorf("create temporary session store: %w", err)
+		return fmt.Errorf("create temporary store: %w", err)
 	}
 	temporaryPath := temporary.Name()
 	keepTemporary := false
@@ -77,21 +87,21 @@ func Save(path string, sessions []core.Session) error {
 
 	if err := temporary.Chmod(0o600); err != nil {
 		_ = temporary.Close()
-		return fmt.Errorf("secure temporary session store: %w", err)
+		return fmt.Errorf("secure temporary store: %w", err)
 	}
 	if _, err := temporary.Write(payload); err != nil {
 		_ = temporary.Close()
-		return fmt.Errorf("write temporary session store: %w", err)
+		return fmt.Errorf("write temporary store: %w", err)
 	}
 	if err := temporary.Sync(); err != nil {
 		_ = temporary.Close()
-		return fmt.Errorf("sync temporary session store: %w", err)
+		return fmt.Errorf("sync temporary store: %w", err)
 	}
 	if err := temporary.Close(); err != nil {
-		return fmt.Errorf("close temporary session store: %w", err)
+		return fmt.Errorf("close temporary store: %w", err)
 	}
 	if err := os.Rename(temporaryPath, path); err != nil {
-		return fmt.Errorf("replace session store: %w", err)
+		return fmt.Errorf("replace store: %w", err)
 	}
 	keepTemporary = true
 	return nil
@@ -137,6 +147,63 @@ func Load(path string) ([]core.Session, error) {
 		}
 	}
 	return sessions, nil
+}
+
+// WorkspacesSchemaVersion is the on-disk schema for the recent-workspaces
+// sidecar file. It is versioned independently of the session store.
+const WorkspacesSchemaVersion = 1
+
+type workspacesData struct {
+	SchemaVersion    int      `json:"schema_version"`
+	RecentWorkspaces []string `json:"recent_workspaces"`
+}
+
+// SaveWorkspaces atomically writes the recent-workspaces list. It is stored in
+// a separate file from the session store so that session-recovery metadata is
+// never coupled to this convenience list.
+func SaveWorkspaces(path string, recent []string) error {
+	if recent == nil {
+		recent = []string{}
+	}
+	payload, err := json.MarshalIndent(workspacesData{SchemaVersion: WorkspacesSchemaVersion, RecentWorkspaces: recent}, "", "  ")
+	if err != nil {
+		return fmt.Errorf("encode workspaces store: %w", err)
+	}
+	payload = append(payload, '\n')
+
+	if err := atomicWrite(path, payload); err != nil {
+		return fmt.Errorf("persist workspaces store: %w", err)
+	}
+	return nil
+}
+
+// LoadWorkspaces reads the recent-workspaces list. A missing file is an empty
+// list; an unsupported schema version fails loudly.
+func LoadWorkspaces(path string) ([]string, error) {
+	file, err := os.Open(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return []string{}, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("open workspaces store: %w", err)
+	}
+	defer file.Close()
+
+	var data workspacesData
+	decoder := json.NewDecoder(file)
+	if err := decoder.Decode(&data); err != nil {
+		return nil, fmt.Errorf("decode workspaces store: %w", err)
+	}
+	if err := ensureJSONEOF(decoder); err != nil {
+		return nil, err
+	}
+	if data.SchemaVersion != WorkspacesSchemaVersion {
+		return nil, fmt.Errorf("unsupported workspaces store schema version %d", data.SchemaVersion)
+	}
+	if data.RecentWorkspaces == nil {
+		return []string{}, nil
+	}
+	return data.RecentWorkspaces, nil
 }
 
 func ensureJSONEOF(decoder *json.Decoder) error {

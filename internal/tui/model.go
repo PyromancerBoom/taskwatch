@@ -19,8 +19,7 @@ type Coordinator interface {
 	Start() (app.Snapshot, error)
 	Refresh() app.Snapshot
 	Inspect(string) (app.ProcessTree, error)
-	SetWorkspace(string) (app.Snapshot, error)
-	Launch(core.Tool) (app.LaunchResult, error)
+	Launch(core.Tool, string) (app.LaunchResult, error)
 }
 
 type screenState uint8
@@ -34,7 +33,8 @@ const (
 
 type workspaceChoice struct {
 	path  string
-	other bool
+	label string // annotation shown in parentheses, e.g. "last used", "current dir"
+	other bool   // the "enter a different folder" entry
 }
 
 type startupMsg struct {
@@ -58,12 +58,6 @@ type inspectMsg struct {
 	loadRequestID uint64
 	tree          app.ProcessTree
 	err           error
-}
-
-type workspaceMsg struct {
-	requestID uint64
-	snapshot  app.Snapshot
-	err       error
 }
 
 type launchMsg struct {
@@ -107,8 +101,6 @@ type Model struct {
 	workspaceDraft       string
 	workspaceCursor      int
 	workspaceErr         error
-	workspacePending     bool
-	workspaceRequestID   uint64
 
 	actionErr       error
 	launchPending   bool
@@ -212,33 +204,26 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 		m.launchPending = false
-		m.snapshot = msg.result.Snapshot
-		m.reconcileSelection()
 		if msg.result.SessionID != "" {
+			// A process was started (msg.err may still be a non-fatal
+			// persistence warning); install the returned snapshot, leave the
+			// picker for the dashboard, and select the new session.
+			m.snapshot = msg.result.Snapshot
+			m.reconcileSelection()
 			m.selectedID = msg.result.SessionID
 			m.ensureSelectionVisible()
+			m.recordCPU()
+			m.actionErr = msg.err
+			m.leaveWorkspaceFlow()
+			return m.scheduleTick()
 		}
-		m.recordCPU()
-		m.actionErr = msg.err
-		return m.scheduleTick()
-	case workspaceMsg:
-		if !m.workspacePending || msg.requestID != m.workspaceRequestID || (m.screen != screenWorkspacePicker && m.screen != screenWorkspaceEditor) {
-			return m, nil
-		}
-		m.workspacePending = false
-		if msg.err != nil {
-			m.workspaceErr = msg.err
-			return m, nil
-		}
-		m.snapshot = msg.snapshot
-		m.workspaceErr = nil
-		m.actionErr = nil
-		m.leaveWorkspaceFlow()
-		m.reconcileSelection()
-		m.recordCPU()
-		return m.scheduleTick()
+		// No process was started (resolve or launch failed): the coordinator
+		// state is unchanged, so stay in the picker/editor with the error and
+		// the typed draft preserved.
+		m.workspaceErr = msg.err
+		return m, nil
 	case tea.PasteMsg:
-		if m.screen == screenWorkspaceEditor && !m.workspacePending {
+		if m.screen == screenWorkspaceEditor && !m.launchPending {
 			m.insertWorkspaceText(msg.Content)
 		}
 		return m, nil
@@ -252,9 +237,6 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if m.launchPending {
 			return m, nil
 		}
-		if m.workspacePending {
-			return m, nil
-		}
 		if m.screen == screenWorkspaceEditor {
 			switch msg.String() {
 			case "esc":
@@ -263,7 +245,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.workspaceCursor = 0
 				m.workspaceErr = nil
 			case "enter":
-				return m.startWorkspaceValidation()
+				return m.startLaunch(m.workspaceDraft)
 			case "left":
 				if m.workspaceCursor > 0 {
 					m.workspaceCursor--
@@ -313,13 +295,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					m.workspaceErr = nil
 					return m, nil
 				}
-				if m.workspacePickerIndex == 0 {
-					m.leaveWorkspaceFlow()
-					return m.scheduleTick()
-				}
-				m.workspaceDraft = choice.path
-				m.workspaceCursor = len([]rune(choice.path))
-				return m.startWorkspaceValidation()
+				return m.startLaunch(choice.path)
 			}
 			return m, nil
 		}
@@ -351,23 +327,13 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		if m.inspectionLoadInFlight {
 			switch msg.String() {
-			case "enter", "r", "w", "c", "x":
+			case "enter", "r", "c", "x":
 				return m, nil
 			}
 		}
 		switch msg.String() {
 		case "esc":
 			m.actionErr = nil
-		case "w":
-			if !m.started || m.refreshing {
-				return m, nil
-			}
-			m.generation++
-			m.refreshRequestID++
-			m.screen = screenWorkspacePicker
-			m.workspaceChoices = workspaceChoices(m.snapshot)
-			m.workspacePickerIndex = 0
-			return m, nil
 		case "enter":
 			if m.selectedID == "" || m.refreshing {
 				return m, nil
@@ -398,12 +364,12 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if !m.started || m.refreshing {
 				return m, nil
 			}
-			return m.startLaunch(core.ToolClaudeCLI)
+			return m.openLaunchPicker(core.ToolClaudeCLI)
 		case "x":
 			if !m.started || m.refreshing {
 				return m, nil
 			}
-			return m.startLaunch(core.ToolCodexCLI)
+			return m.openLaunchPicker(core.ToolCodexCLI)
 		case "up":
 			m.moveSelection(-1)
 		case "down":
@@ -419,37 +385,73 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	}
 }
 
+// workspaceChoices builds the launch picker's folder list: the persisted
+// recent workspaces first (most-recent first, so index 0 is the last used),
+// then the current directory, then the workspaces of live sessions in
+// case-insensitive order, and finally the custom-folder entry. Paths already
+// listed are skipped case-insensitively so nothing appears twice.
 func workspaceChoices(snapshot app.Snapshot) []workspaceChoice {
-	choices := []workspaceChoice{{path: snapshot.Workspace}}
-	paths := make([]string, 0, len(snapshot.Sessions))
+	var choices []workspaceChoice
+	seen := make(map[string]bool)
+	add := func(path, label string) {
+		if strings.TrimSpace(path) == "" {
+			return
+		}
+		key := strings.ToLower(path)
+		if seen[key] {
+			return
+		}
+		seen[key] = true
+		choices = append(choices, workspaceChoice{path: path, label: label})
+	}
+
+	for i, path := range snapshot.RecentWorkspaces {
+		label := ""
+		if i == 0 {
+			label = "last used"
+		}
+		add(path, label)
+	}
+	add(snapshot.CurrentDir, "current dir")
+
+	sessionPaths := make([]string, 0, len(snapshot.Sessions))
 	for _, session := range snapshot.Sessions {
-		path := session.Workspace
-		if path == "" || strings.EqualFold(path, snapshot.Workspace) {
+		if session.State == core.StateExited {
 			continue
 		}
-		duplicate := false
-		for _, existing := range paths {
-			if strings.EqualFold(existing, path) {
-				duplicate = true
-				break
-			}
-		}
-		if !duplicate {
-			paths = append(paths, path)
+		if session.Workspace != "" {
+			sessionPaths = append(sessionPaths, session.Workspace)
 		}
 	}
-	sort.SliceStable(paths, func(i, j int) bool {
-		left := strings.ToLower(paths[i])
-		right := strings.ToLower(paths[j])
+	sort.SliceStable(sessionPaths, func(i, j int) bool {
+		left := strings.ToLower(sessionPaths[i])
+		right := strings.ToLower(sessionPaths[j])
 		if left == right {
-			return paths[i] < paths[j]
+			return sessionPaths[i] < sessionPaths[j]
 		}
 		return left < right
 	})
-	for _, path := range paths {
-		choices = append(choices, workspaceChoice{path: path})
+	for _, path := range sessionPaths {
+		add(path, "")
 	}
+
 	return append(choices, workspaceChoice{other: true})
+}
+
+// openLaunchPicker enters the workspace picker for a pending launch of tool.
+// It bumps the refresh generation/request so any pending or in-flight refresh
+// tick is ignored while the picker is open.
+func (m Model) openLaunchPicker(tool core.Tool) (tea.Model, tea.Cmd) {
+	m.generation++
+	m.refreshRequestID++
+	m.launchTool = tool
+	m.screen = screenWorkspacePicker
+	m.workspaceChoices = workspaceChoices(m.snapshot)
+	m.workspacePickerIndex = 0
+	m.workspaceDraft = ""
+	m.workspaceCursor = 0
+	m.workspaceErr = nil
+	return m, nil
 }
 
 func (m *Model) leaveWorkspaceFlow() {
@@ -459,20 +461,6 @@ func (m *Model) leaveWorkspaceFlow() {
 	m.workspaceDraft = ""
 	m.workspaceCursor = 0
 	m.workspaceErr = nil
-	m.workspacePending = false
-	m.workspaceRequestID++
-}
-
-func (m Model) startWorkspaceValidation() (tea.Model, tea.Cmd) {
-	m.workspacePending = true
-	m.workspaceErr = nil
-	m.workspaceRequestID++
-	requestID := m.workspaceRequestID
-	path := m.workspaceDraft
-	return m, func() tea.Msg {
-		snapshot, err := m.coordinator.SetWorkspace(path)
-		return workspaceMsg{requestID: requestID, snapshot: snapshot, err: err}
-	}
 }
 
 func (m *Model) moveWorkspacePicker(delta int) {
@@ -574,15 +562,20 @@ func (m Model) startRefresh(userAction bool) (tea.Model, tea.Cmd) {
 	}
 }
 
-func (m Model) startLaunch(tool core.Tool) (tea.Model, tea.Cmd) {
+// startLaunch launches the pending tool (m.launchTool) in the given workspace
+// folder. It is invoked from the workspace picker or the custom-folder editor;
+// the launchMsg handler decides whether to leave the flow (a process started)
+// or stay with an error (resolve or launch failed).
+func (m Model) startLaunch(path string) (tea.Model, tea.Cmd) {
 	m.launchPending = true
-	m.launchTool = tool
 	m.launchRequestID++
 	m.generation++
 	m.refreshRequestID++
+	m.workspaceErr = nil
 	requestID := m.launchRequestID
+	tool := m.launchTool
 	return m, func() tea.Msg {
-		result, err := m.coordinator.Launch(tool)
+		result, err := m.coordinator.Launch(tool, path)
 		return launchMsg{requestID: requestID, result: result, err: err}
 	}
 }

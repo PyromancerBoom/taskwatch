@@ -21,10 +21,8 @@ type stubCoordinator struct {
 	startCalls       int
 	refreshCalls     int
 	refreshSnapshot  app.Snapshot
-	workspaceCalls   []string
-	workspaceResults []app.Snapshot
-	workspaceErrs    []error
 	launchCalls      []core.Tool
+	launchWorkspaces []string
 	launchResults    []app.LaunchResult
 	launchErrs       []error
 	inspectCalls     []string
@@ -33,23 +31,10 @@ type stubCoordinator struct {
 	events           []string
 }
 
-func (c *stubCoordinator) SetWorkspace(path string) (app.Snapshot, error) {
-	call := len(c.workspaceCalls)
-	c.workspaceCalls = append(c.workspaceCalls, path)
-	var snapshot app.Snapshot
-	if call < len(c.workspaceResults) {
-		snapshot = c.workspaceResults[call]
-	}
-	var err error
-	if call < len(c.workspaceErrs) {
-		err = c.workspaceErrs[call]
-	}
-	return snapshot, err
-}
-
-func (c *stubCoordinator) Launch(tool core.Tool) (app.LaunchResult, error) {
+func (c *stubCoordinator) Launch(tool core.Tool, workspace string) (app.LaunchResult, error) {
 	call := len(c.launchCalls)
 	c.launchCalls = append(c.launchCalls, tool)
+	c.launchWorkspaces = append(c.launchWorkspaces, workspace)
 	var result app.LaunchResult
 	if call < len(c.launchResults) {
 		result = c.launchResults[call]
@@ -148,12 +133,12 @@ func TestStartupSuccessInstallsSnapshotSelectsFirstAndSchedulesTick(t *testing.T
 	model := NewModel(coordinator, 37*time.Millisecond)
 	var calls []tickCall
 	model.tick = fakeTick(&calls)
-	snapshot := app.Snapshot{Workspace: `C:\work`, Sessions: []core.Session{session("one"), session("two")}}
+	snapshot := app.Snapshot{CurrentDir: `C:\work`, Sessions: []core.Session{session("one"), session("two")}}
 
 	model, cmd := update(t, model, startupMsg{snapshot: snapshot})
 
-	if model.snapshot.Workspace != snapshot.Workspace || model.selectedID != "one" || !model.started {
-		t.Fatalf("startup state = workspace %q selected %q started %v", model.snapshot.Workspace, model.selectedID, model.started)
+	if model.snapshot.CurrentDir != snapshot.CurrentDir || model.selectedID != "one" || !model.started {
+		t.Fatalf("startup state = current dir %q selected %q started %v", model.snapshot.CurrentDir, model.selectedID, model.started)
 	}
 	if cmd == nil || len(calls) != 1 || calls[0].duration != 37*time.Millisecond {
 		t.Fatalf("scheduled ticks = %#v, cmd nil = %v", calls, cmd == nil)
@@ -265,7 +250,7 @@ func TestCurrentTickStartsOneRefresh(t *testing.T) {
 	}
 }
 
-func TestWOpensOrderedWorkspacePickerAndInvalidatesTimer(t *testing.T) {
+func TestLaunchKeyOpensOrderedWorkspacePickerAndInvalidatesTimer(t *testing.T) {
 	coordinator := &stubCoordinator{}
 	model := NewModel(coordinator, time.Second)
 	var calls []tickCall
@@ -277,16 +262,16 @@ func TestWOpensOrderedWorkspacePickerAndInvalidatesTimer(t *testing.T) {
 		{ID: "four", Workspace: ""},
 		{ID: "five", Workspace: `C:\active`},
 	}
-	model, _ = update(t, model, startupMsg{snapshot: app.Snapshot{Workspace: `C:\active`, Sessions: sessions}})
+	model, _ = update(t, model, startupMsg{snapshot: app.Snapshot{CurrentDir: `C:\active`, Sessions: sessions}})
 	oldTick := calls[0].msg
 
-	model, cmd := update(t, model, key("w"))
+	model, cmd := update(t, model, key("c"))
 
-	if cmd != nil || model.screen != screenWorkspacePicker {
-		t.Fatalf("open picker: screen=%v cmd=%v", model.screen, cmd)
+	if cmd != nil || model.screen != screenWorkspacePicker || model.launchTool != core.ToolClaudeCLI {
+		t.Fatalf("open picker: screen=%v cmd=%v tool=%q", model.screen, cmd, model.launchTool)
 	}
 	want := []workspaceChoice{
-		{path: `C:\active`},
+		{path: `C:\active`, label: "current dir"},
 		{path: `C:\Alpha`},
 		{path: `C:\zeta`},
 		{other: true},
@@ -304,36 +289,57 @@ func TestWOpensOrderedWorkspacePickerAndInvalidatesTimer(t *testing.T) {
 	}
 }
 
+func TestWorkspaceChoicesExcludeExitedSessionWorkspaces(t *testing.T) {
+	got := workspaceChoices(app.Snapshot{
+		CurrentDir: `C:\current`,
+		Sessions: []core.Session{
+			{ID: "running", State: core.StateRunning, Workspace: `C:\live`},
+			{ID: "exited", State: core.StateExited, Workspace: `C:\stale`},
+		},
+	})
+
+	want := []workspaceChoice{
+		{path: `C:\current`, label: "current dir"},
+		{path: `C:\live`},
+		{other: true},
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("workspaceChoices() = %#v, want no exited-session workspace: %#v", got, want)
+	}
+}
+
 func TestEscapeClosesWorkspacePickerAndResumesTimerWithoutCoordinatorCall(t *testing.T) {
 	coordinator := &stubCoordinator{}
 	model := NewModel(coordinator, time.Second)
 	var calls []tickCall
 	model.tick = fakeTick(&calls)
-	model, _ = update(t, model, startupMsg{snapshot: app.Snapshot{Workspace: `C:\active`}})
-	model, _ = update(t, model, key("w"))
+	model, _ = update(t, model, startupMsg{snapshot: app.Snapshot{CurrentDir: `C:\active`}})
+	model, _ = update(t, model, key("c"))
 
 	model, cmd := update(t, model, key("esc"))
 
 	if model.screen != screenDashboard || cmd == nil || len(calls) != 2 {
 		t.Fatalf("escape picker: screen=%v cmd nil=%v ticks=%d", model.screen, cmd == nil, len(calls))
 	}
-	if len(coordinator.workspaceCalls) != 0 || coordinator.refreshCalls != 0 || model.snapshot.Workspace != `C:\active` {
-		t.Fatalf("escape mutated coordinator/model: workspace calls=%v refresh=%d snapshot=%#v", coordinator.workspaceCalls, coordinator.refreshCalls, model.snapshot)
+	if len(coordinator.launchCalls) != 0 || coordinator.refreshCalls != 0 || model.snapshot.CurrentDir != `C:\active` {
+		t.Fatalf("escape mutated coordinator/model: launch calls=%v refresh=%d snapshot=%#v", coordinator.launchCalls, coordinator.refreshCalls, model.snapshot)
 	}
 }
 
+// workspaceModel starts the dashboard and opens the launch picker with the
+// "c" (Claude) launch key, returning the model and its tick-call log.
 func workspaceModel(t *testing.T, coordinator *stubCoordinator, sessions []core.Session) (Model, *[]tickCall) {
 	t.Helper()
 	model := NewModel(coordinator, time.Second)
 	calls := new([]tickCall)
 	model.tick = fakeTick(calls)
-	model, _ = update(t, model, startupMsg{snapshot: app.Snapshot{Workspace: `C:\active`, Sessions: sessions}})
-	model, _ = update(t, model, key("w"))
+	model, _ = update(t, model, startupMsg{snapshot: app.Snapshot{CurrentDir: `C:\active`, Sessions: sessions}})
+	model, _ = update(t, model, key("c"))
 	return model, calls
 }
 
-func TestWorkspacePickerMovementAndActiveSelection(t *testing.T) {
-	coordinator := &stubCoordinator{}
+func TestWorkspacePickerMovementAndLaunchSelection(t *testing.T) {
+	coordinator := &stubCoordinator{launchResults: []app.LaunchResult{{Snapshot: app.Snapshot{CurrentDir: `C:\active`}, SessionID: "launched"}}}
 	model, ticks := workspaceModel(t, coordinator, []core.Session{
 		{ID: "one", Workspace: `C:\one`},
 		{ID: "two", Workspace: `C:\two`},
@@ -345,42 +351,50 @@ func TestWorkspacePickerMovementAndActiveSelection(t *testing.T) {
 	}
 	model, _ = update(t, model, key("pgup"))
 	if model.workspacePickerIndex != 0 {
-		t.Fatalf("PgUp index = %d, want active row 0", model.workspacePickerIndex)
+		t.Fatalf("PgUp index = %d, want first row 0", model.workspacePickerIndex)
 	}
 
 	model, cmd := update(t, model, key("enter"))
-	if model.screen != screenDashboard || cmd == nil || len(*ticks) != 2 || len(coordinator.workspaceCalls) != 0 {
-		t.Fatalf("active enter: screen=%v cmd nil=%v ticks=%d calls=%v", model.screen, cmd == nil, len(*ticks), coordinator.workspaceCalls)
+	if !model.launchPending || cmd == nil || len(coordinator.launchCalls) != 0 {
+		t.Fatalf("launch selection: pending=%v cmd nil=%v synchronous calls=%v", model.launchPending, cmd == nil, coordinator.launchCalls)
+	}
+	model, nextTick := update(t, model, cmd())
+	if model.screen != screenDashboard || model.launchPending || nextTick == nil || len(*ticks) != 2 {
+		t.Fatalf("launch completion: screen=%v pending=%v tick nil=%v ticks=%d", model.screen, model.launchPending, nextTick == nil, len(*ticks))
+	}
+	if !reflect.DeepEqual(coordinator.launchCalls, []core.Tool{core.ToolClaudeCLI}) || !reflect.DeepEqual(coordinator.launchWorkspaces, []string{`C:\active`}) {
+		t.Fatalf("launch call = %v in %v, want claude in current dir", coordinator.launchCalls, coordinator.launchWorkspaces)
 	}
 }
 
-func TestWorkspaceKnownSelectionValidatesAsynchronouslyAndInstallsSuccess(t *testing.T) {
+func TestWorkspaceKnownSelectionLaunchesAsynchronouslyAndInstallsSuccess(t *testing.T) {
 	want := app.Snapshot{
-		Workspace: `C:\other`,
+		CurrentDir: `C:\active`,
 		Sessions: []core.Session{
 			{ID: "old", Workspace: `C:\original`},
 			{ID: "new", Workspace: `C:\other`},
 		},
 	}
-	coordinator := &stubCoordinator{workspaceResults: []app.Snapshot{want}}
+	coordinator := &stubCoordinator{launchResults: []app.LaunchResult{{Snapshot: want, SessionID: "new"}}}
 	model, ticks := workspaceModel(t, coordinator, []core.Session{{ID: "old", Workspace: `C:\other`}})
 	model.actionErr = errors.New("old launch failure")
+	// Choices: [C:\active (current dir), C:\other (session), other]; select C:\other.
 	model, _ = update(t, model, key("down"))
 
 	model, cmd := update(t, model, key("enter"))
-	if !model.workspacePending || cmd == nil || len(coordinator.workspaceCalls) != 0 {
-		t.Fatalf("known submit: pending=%v cmd nil=%v synchronous calls=%v", model.workspacePending, cmd == nil, coordinator.workspaceCalls)
+	if !model.launchPending || cmd == nil || len(coordinator.launchCalls) != 0 {
+		t.Fatalf("known submit: pending=%v cmd nil=%v synchronous calls=%v", model.launchPending, cmd == nil, coordinator.launchCalls)
 	}
 	result := cmd()
-	if !reflect.DeepEqual(coordinator.workspaceCalls, []string{`C:\other`}) {
-		t.Fatalf("SetWorkspace calls = %v, want C:\\other", coordinator.workspaceCalls)
+	if !reflect.DeepEqual(coordinator.launchWorkspaces, []string{`C:\other`}) {
+		t.Fatalf("Launch workspace = %v, want C:\\other", coordinator.launchWorkspaces)
 	}
 	model, nextTick := update(t, model, result)
-	if model.screen != screenDashboard || model.workspacePending || model.workspaceErr != nil || model.actionErr != nil {
-		t.Fatalf("workspace success state: screen=%v pending=%v workspace err=%v action err=%v", model.screen, model.workspacePending, model.workspaceErr, model.actionErr)
+	if model.screen != screenDashboard || model.launchPending || model.workspaceErr != nil || model.actionErr != nil {
+		t.Fatalf("launch success state: screen=%v pending=%v workspace err=%v action err=%v", model.screen, model.launchPending, model.workspaceErr, model.actionErr)
 	}
-	if !reflect.DeepEqual(model.snapshot, want) || model.selectedID != "old" || nextTick == nil || len(*ticks) != 2 {
-		t.Fatalf("workspace success: snapshot=%#v selected=%q tick nil=%v ticks=%d", model.snapshot, model.selectedID, nextTick == nil, len(*ticks))
+	if !reflect.DeepEqual(model.snapshot, want) || model.selectedID != "new" || nextTick == nil || len(*ticks) != 2 {
+		t.Fatalf("launch success: snapshot=%#v selected=%q tick nil=%v ticks=%d", model.snapshot, model.selectedID, nextTick == nil, len(*ticks))
 	}
 	if model.snapshot.Sessions[0].Workspace != `C:\original` {
 		t.Fatalf("TUI rewrote returned session workspace: %#v", model.snapshot.Sessions)
@@ -401,8 +415,8 @@ func TestWorkspaceOtherEditorHasTwoLayerCancellation(t *testing.T) {
 		t.Fatalf("editor escape: screen=%v cmd=%v ticks=%d", model.screen, cmd, len(*ticks))
 	}
 	model, cmd = update(t, model, key("esc"))
-	if model.screen != screenDashboard || cmd == nil || len(*ticks) != 2 || len(coordinator.workspaceCalls) != 0 {
-		t.Fatalf("picker escape: screen=%v cmd nil=%v ticks=%d calls=%v", model.screen, cmd == nil, len(*ticks), coordinator.workspaceCalls)
+	if model.screen != screenDashboard || cmd == nil || len(*ticks) != 2 || len(coordinator.launchCalls) != 0 {
+		t.Fatalf("picker escape: screen=%v cmd nil=%v ticks=%d calls=%v", model.screen, cmd == nil, len(*ticks), coordinator.launchCalls)
 	}
 }
 
@@ -432,30 +446,30 @@ func TestWorkspaceEditorOperationsPasteAndLiteralKQ(t *testing.T) {
 	}
 }
 
-func TestWorkspaceValidationFailureStaysInlineWithDraftAndBlocksKeysWhilePending(t *testing.T) {
+func TestWorkspaceLaunchFailureStaysInlineWithDraftAndBlocksKeysWhilePending(t *testing.T) {
 	wantErr := errors.New("folder does not exist")
-	coordinator := &stubCoordinator{workspaceErrs: []error{wantErr}}
+	coordinator := &stubCoordinator{launchErrs: []error{wantErr}, launchResults: []app.LaunchResult{{}}}
 	model, ticks := workspaceModel(t, coordinator, nil)
-	model, _ = update(t, model, key("down"))
-	model, _ = update(t, model, key("enter"))
+	model, _ = update(t, model, key("down"))  // move to "enter a different folder…"
+	model, _ = update(t, model, key("enter")) // open the custom-folder editor
 	model, _ = update(t, model, tea.PasteMsg{Content: `C:\missing\kq`})
 
 	model, cmd := update(t, model, key("enter"))
-	if !model.workspacePending || cmd == nil {
-		t.Fatalf("editor submit: pending=%v cmd nil=%v", model.workspacePending, cmd == nil)
+	if !model.launchPending || cmd == nil {
+		t.Fatalf("editor submit: pending=%v cmd nil=%v", model.launchPending, cmd == nil)
 	}
 	pending := model
 	model, ignored := update(t, model, key("esc"))
-	if ignored != nil || model.screen != pending.screen || model.workspaceDraft != pending.workspaceDraft || !model.workspacePending {
+	if ignored != nil || model.screen != pending.screen || model.workspaceDraft != pending.workspaceDraft || !model.launchPending {
 		t.Fatalf("pending Esc mutated editor: before=%#v after=%#v cmd=%v", pending, model, ignored)
 	}
 
 	model, nextCmd := update(t, model, cmd())
-	if model.screen != screenWorkspaceEditor || model.workspacePending || !errors.Is(model.workspaceErr, wantErr) || model.workspaceDraft != `C:\missing\kq` {
-		t.Fatalf("validation failure: screen=%v pending=%v err=%v draft=%q", model.screen, model.workspacePending, model.workspaceErr, model.workspaceDraft)
+	if model.screen != screenWorkspaceEditor || model.launchPending || !errors.Is(model.workspaceErr, wantErr) || model.workspaceDraft != `C:\missing\kq` {
+		t.Fatalf("launch failure: screen=%v pending=%v err=%v draft=%q", model.screen, model.launchPending, model.workspaceErr, model.workspaceDraft)
 	}
-	if nextCmd != nil || len(*ticks) != 1 || !reflect.DeepEqual(coordinator.workspaceCalls, []string{`C:\missing\kq`}) {
-		t.Fatalf("validation failure resumed work: cmd=%v ticks=%d calls=%v", nextCmd, len(*ticks), coordinator.workspaceCalls)
+	if nextCmd != nil || len(*ticks) != 1 || !reflect.DeepEqual(coordinator.launchWorkspaces, []string{`C:\missing\kq`}) {
+		t.Fatalf("launch failure resumed work: cmd=%v ticks=%d calls=%v", nextCmd, len(*ticks), coordinator.launchWorkspaces)
 	}
 }
 
@@ -470,26 +484,47 @@ func launchModel(t *testing.T, coordinator *stubCoordinator, snapshot app.Snapsh
 	return model, calls
 }
 
-func TestLaunchKeysMapExactlyAndRunAsynchronously(t *testing.T) {
+// beginLaunch presses a launch key ("c" or "x") to open the workspace picker,
+// then Enter to launch in the pre-selected (first) workspace. It returns the
+// resulting model and the async launch command.
+func beginLaunch(t *testing.T, model Model, launchKey string) (Model, tea.Cmd) {
+	t.Helper()
+	model, openCmd := update(t, model, key(launchKey))
+	if model.screen != screenWorkspacePicker || openCmd != nil {
+		t.Fatalf("launch key %q did not open picker: screen=%v cmd=%v", launchKey, model.screen, openCmd)
+	}
+	choice := model.workspaceChoices[model.workspacePickerIndex]
+	if choice.other || choice.path == "" {
+		t.Fatalf("picker has no launchable pre-selected workspace: %#v", choice)
+	}
+	return update(t, model, key("enter"))
+}
+
+func TestLaunchKeysOpenPickerThenLaunchSelectedWorkspaceAsynchronously(t *testing.T) {
 	for _, tc := range []struct {
 		key  string
 		tool core.Tool
 	}{{key: "c", tool: core.ToolClaudeCLI}, {key: "x", tool: core.ToolCodexCLI}} {
 		t.Run(tc.key, func(t *testing.T) {
-			coordinator := &stubCoordinator{launchResults: []app.LaunchResult{{Snapshot: app.Snapshot{Workspace: `C:\repo`}}}}
-			model, _ := launchModel(t, coordinator, app.Snapshot{Workspace: `C:\repo`})
+			coordinator := &stubCoordinator{launchResults: []app.LaunchResult{{Snapshot: app.Snapshot{CurrentDir: `C:\repo`}, SessionID: "launched"}}}
+			model, _ := launchModel(t, coordinator, app.Snapshot{CurrentDir: `C:\repo`})
 
-			model, cmd := update(t, model, key(tc.key))
-			if !model.launchPending || model.launchTool != tc.tool || cmd == nil || len(coordinator.launchCalls) != 0 {
-				t.Fatalf("launch start: pending=%v tool=%q cmd nil=%v calls=%v", model.launchPending, model.launchTool, cmd == nil, coordinator.launchCalls)
+			model, openCmd := update(t, model, key(tc.key))
+			if model.screen != screenWorkspacePicker || model.launchTool != tc.tool || openCmd != nil || len(coordinator.launchCalls) != 0 {
+				t.Fatalf("open picker: screen=%v tool=%q cmd=%v calls=%v", model.screen, model.launchTool, openCmd, coordinator.launchCalls)
+			}
+
+			model, cmd := update(t, model, key("enter"))
+			if !model.launchPending || cmd == nil || len(coordinator.launchCalls) != 0 {
+				t.Fatalf("launch start: pending=%v cmd nil=%v calls=%v", model.launchPending, cmd == nil, coordinator.launchCalls)
 			}
 			result := cmd()
-			if !reflect.DeepEqual(coordinator.launchCalls, []core.Tool{tc.tool}) {
-				t.Fatalf("Launch calls = %v, want [%s]", coordinator.launchCalls, tc.tool)
+			if !reflect.DeepEqual(coordinator.launchCalls, []core.Tool{tc.tool}) || !reflect.DeepEqual(coordinator.launchWorkspaces, []string{`C:\repo`}) {
+				t.Fatalf("Launch calls = %v in %v, want [%s] in current dir", coordinator.launchCalls, coordinator.launchWorkspaces, tc.tool)
 			}
 			model, _ = update(t, model, result)
-			if model.launchPending || model.actionErr != nil {
-				t.Fatalf("launch completion: pending=%v err=%v", model.launchPending, model.actionErr)
+			if model.launchPending || model.actionErr != nil || model.screen != screenDashboard {
+				t.Fatalf("launch completion: pending=%v err=%v screen=%v", model.launchPending, model.actionErr, model.screen)
 			}
 		})
 	}
@@ -510,16 +545,16 @@ func TestActionsDoNotOverlapRefreshInspectionWorkspaceOrLaunch(t *testing.T) {
 				t.Fatalf("refresh allowed %q: cmd=%v screen=%v", name, cmd, model.screen)
 			}
 		}
-		if len(coordinator.launchCalls) != 0 || len(coordinator.workspaceCalls) != 0 || len(coordinator.inspectCalls) != 0 {
-			t.Fatalf("refresh overlap calls: launch=%v workspace=%v inspect=%v", coordinator.launchCalls, coordinator.workspaceCalls, coordinator.inspectCalls)
+		if len(coordinator.launchCalls) != 0 || len(coordinator.inspectCalls) != 0 {
+			t.Fatalf("refresh overlap calls: launch=%v inspect=%v", coordinator.launchCalls, coordinator.inspectCalls)
 		}
 	})
 
 	t.Run("launch blocks duplicate and other actions", func(t *testing.T) {
 		coordinator := &stubCoordinator{}
-		model, ticks := launchModel(t, coordinator, app.Snapshot{Sessions: []core.Session{session("one")}})
+		model, ticks := launchModel(t, coordinator, app.Snapshot{CurrentDir: `C:\repo`, Sessions: []core.Session{session("one")}})
 		oldTick := (*ticks)[0].msg
-		model, launchCmd := update(t, model, key("c"))
+		model, launchCmd := beginLaunch(t, model, "c")
 		if launchCmd == nil || !model.launchPending {
 			t.Fatal("precondition: launch did not start")
 		}
@@ -530,8 +565,8 @@ func TestActionsDoNotOverlapRefreshInspectionWorkspaceOrLaunch(t *testing.T) {
 				t.Fatalf("launch pending allowed %T/%v", message, message)
 			}
 		}
-		if len(coordinator.launchCalls) != 0 || coordinator.refreshCalls != 0 || len(coordinator.workspaceCalls) != 0 || len(coordinator.inspectCalls) != 0 {
-			t.Fatalf("pending launch caused calls: launch=%v refresh=%d workspace=%v inspect=%v", coordinator.launchCalls, coordinator.refreshCalls, coordinator.workspaceCalls, coordinator.inspectCalls)
+		if len(coordinator.launchCalls) != 0 || coordinator.refreshCalls != 0 || len(coordinator.inspectCalls) != 0 {
+			t.Fatalf("pending launch caused calls: launch=%v refresh=%d inspect=%v", coordinator.launchCalls, coordinator.refreshCalls, coordinator.inspectCalls)
 		}
 	})
 
@@ -556,11 +591,11 @@ func TestLaunchSuccessSelectsAndScrollsLaunchedSessionIntoView(t *testing.T) {
 	}
 	launched := session("launched")
 	launched.Workspace = `C:\launched-visible`
-	wantSnapshot := app.Snapshot{Workspace: `C:\repo`, Sessions: append(append([]core.Session(nil), sessions...), launched)}
+	wantSnapshot := app.Snapshot{CurrentDir: `C:\repo`, Sessions: append(append([]core.Session(nil), sessions...), launched)}
 	coordinator := &stubCoordinator{launchResults: []app.LaunchResult{{Snapshot: wantSnapshot, SessionID: "launched"}}}
-	model, _ := launchModel(t, coordinator, app.Snapshot{Workspace: `C:\repo`, Sessions: sessions})
+	model, _ := launchModel(t, coordinator, app.Snapshot{CurrentDir: `C:\repo`, Sessions: sessions})
 
-	model, cmd := update(t, model, key("x"))
+	model, cmd := beginLaunch(t, model, "x")
 	model, _ = update(t, model, cmd())
 
 	if !reflect.DeepEqual(model.snapshot, wantSnapshot) || model.selectedID != "launched" || model.scrollOffset == 0 {
@@ -571,20 +606,25 @@ func TestLaunchSuccessSelectsAndScrollsLaunchedSessionIntoView(t *testing.T) {
 	}
 }
 
-func TestLaunchSupervisorErrorInstallsSnapshotAndSetsActionError(t *testing.T) {
+func TestLaunchSupervisorErrorStaysInPickerWithInlineError(t *testing.T) {
 	wantErr := errors.New("supervisor unavailable")
-	wantSnapshot := app.Snapshot{Workspace: `C:\still-current`, Sessions: []core.Session{session("old")}}
+	current := app.Snapshot{CurrentDir: `C:\before`}
 	coordinator := &stubCoordinator{
-		launchResults: []app.LaunchResult{{Snapshot: wantSnapshot}},
+		// SessionID is empty: no process started, so the coordinator returns
+		// its unchanged snapshot alongside the error.
+		launchResults: []app.LaunchResult{{Snapshot: app.Snapshot{CurrentDir: `C:\still-current`}}},
 		launchErrs:    []error{wantErr},
 	}
-	model, ticks := launchModel(t, coordinator, app.Snapshot{Workspace: `C:\before`})
+	model, ticks := launchModel(t, coordinator, current)
 
-	model, cmd := update(t, model, key("c"))
+	model, cmd := beginLaunch(t, model, "c")
 	model, nextTick := update(t, model, cmd())
 
-	if model.launchPending || !reflect.DeepEqual(model.snapshot, wantSnapshot) || !errors.Is(model.actionErr, wantErr) || nextTick == nil || len(*ticks) != 2 {
-		t.Fatalf("launch error: pending=%v snapshot=%#v err=%v tick nil=%v ticks=%d", model.launchPending, model.snapshot, model.actionErr, nextTick == nil, len(*ticks))
+	if model.launchPending || model.screen != screenWorkspacePicker || !errors.Is(model.workspaceErr, wantErr) || model.actionErr != nil {
+		t.Fatalf("launch error: pending=%v screen=%v workspace err=%v action err=%v", model.launchPending, model.screen, model.workspaceErr, model.actionErr)
+	}
+	if nextTick != nil || !reflect.DeepEqual(model.snapshot, current) || len(*ticks) != 1 {
+		t.Fatalf("launch error resumed/installed: tick=%v snapshot=%#v ticks=%d", nextTick, model.snapshot, len(*ticks))
 	}
 }
 
@@ -592,15 +632,15 @@ func TestLaunchPersistenceErrorKeepsUpdatedSnapshotSelectionAndBannerUntilDismis
 	wantErr := errors.New("save launched session: disk full")
 	launched := session("new-session")
 	launched.Workspace = `C:\new-session`
-	wantSnapshot := app.Snapshot{Workspace: `C:\repo`, Sessions: []core.Session{session("old"), launched}}
+	wantSnapshot := app.Snapshot{CurrentDir: `C:\repo`, Sessions: []core.Session{session("old"), launched}}
 	coordinator := &stubCoordinator{
 		launchResults:   []app.LaunchResult{{Snapshot: wantSnapshot, SessionID: "new-session"}},
 		launchErrs:      []error{wantErr},
 		refreshSnapshot: wantSnapshot,
 	}
-	model, ticks := launchModel(t, coordinator, app.Snapshot{Workspace: `C:\repo`, Sessions: []core.Session{session("old")}})
+	model, ticks := launchModel(t, coordinator, app.Snapshot{CurrentDir: `C:\repo`, Sessions: []core.Session{session("old")}})
 
-	model, launchCmd := update(t, model, key("x"))
+	model, launchCmd := beginLaunch(t, model, "x")
 	model, _ = update(t, model, launchCmd())
 	if !reflect.DeepEqual(model.snapshot, wantSnapshot) || model.selectedID != "new-session" || !errors.Is(model.actionErr, wantErr) {
 		t.Fatalf("persistence error result: snapshot=%#v selected=%q err=%v", model.snapshot, model.selectedID, model.actionErr)
@@ -617,39 +657,50 @@ func TestLaunchPersistenceErrorKeepsUpdatedSnapshotSelectionAndBannerUntilDismis
 	}
 }
 
-func TestLaterSuccessfulLaunchClearsActionError(t *testing.T) {
+func TestRetryAfterFailedLaunchClearsInlineErrorAndLeavesFlow(t *testing.T) {
 	wantErr := errors.New("first launch failed")
-	snapshot := app.Snapshot{Workspace: `C:\repo`}
+	current := app.Snapshot{CurrentDir: `C:\repo`}
 	coordinator := &stubCoordinator{
-		launchResults: []app.LaunchResult{{Snapshot: snapshot}, {Snapshot: snapshot}},
+		launchResults: []app.LaunchResult{{Snapshot: current}, {Snapshot: current, SessionID: "launched"}},
 		launchErrs:    []error{wantErr, nil},
 	}
-	model, _ := launchModel(t, coordinator, snapshot)
-	model, firstCmd := update(t, model, key("c"))
+	model, _ := launchModel(t, coordinator, current)
+
+	// First attempt fails and stays in the picker with an inline error.
+	model, firstCmd := beginLaunch(t, model, "c")
 	model, _ = update(t, model, firstCmd())
-	model, secondCmd := update(t, model, key("x"))
+	if model.screen != screenWorkspacePicker || !errors.Is(model.workspaceErr, wantErr) {
+		t.Fatalf("first attempt: screen=%v err=%v", model.screen, model.workspaceErr)
+	}
+
+	// Retrying the same pre-selected workspace succeeds, clears the inline
+	// error, and leaves the picker.
+	model, secondCmd := update(t, model, key("enter"))
 	model, _ = update(t, model, secondCmd())
-	if model.actionErr != nil || !reflect.DeepEqual(coordinator.launchCalls, []core.Tool{core.ToolClaudeCLI, core.ToolCodexCLI}) {
-		t.Fatalf("successful launch: err=%v calls=%v", model.actionErr, coordinator.launchCalls)
+	if model.screen != screenDashboard || model.workspaceErr != nil || model.actionErr != nil {
+		t.Fatalf("retry: screen=%v workspace err=%v action err=%v", model.screen, model.workspaceErr, model.actionErr)
+	}
+	if !reflect.DeepEqual(coordinator.launchCalls, []core.Tool{core.ToolClaudeCLI, core.ToolClaudeCLI}) {
+		t.Fatalf("launch calls = %v, want two claude launches", coordinator.launchCalls)
 	}
 }
 
 func TestStaleLaunchAndRefreshResultsCannotOverwriteNewerSnapshots(t *testing.T) {
-	refreshed := app.Snapshot{Workspace: `C:\refreshed`, Sessions: []core.Session{session("refreshed")}}
-	launched := app.Snapshot{Workspace: `C:\launched`, Sessions: []core.Session{session("launched")}}
+	refreshed := app.Snapshot{CurrentDir: `C:\refreshed`, Sessions: []core.Session{session("refreshed")}}
+	launched := app.Snapshot{CurrentDir: `C:\launched`, Sessions: []core.Session{session("launched")}}
 	coordinator := &stubCoordinator{
 		refreshSnapshot: refreshed,
 		launchResults:   []app.LaunchResult{{Snapshot: launched, SessionID: "launched"}},
 	}
-	model, _ := launchModel(t, coordinator, app.Snapshot{Workspace: `C:\initial`})
+	model, _ := launchModel(t, coordinator, app.Snapshot{CurrentDir: `C:\initial`})
 	model, refreshCmd := update(t, model, key("r"))
 	oldRefreshResult := refreshCmd()
 	model, _ = update(t, model, oldRefreshResult)
 
-	model, launchCmd := update(t, model, key("c"))
+	model, launchCmd := beginLaunch(t, model, "c")
 	requestID := model.launchRequestID
-	model, _ = update(t, model, launchMsg{requestID: requestID - 1, result: app.LaunchResult{Snapshot: refreshed}})
-	if !model.launchPending || model.snapshot.Workspace != `C:\refreshed` {
+	model, _ = update(t, model, launchMsg{requestID: requestID - 1, result: app.LaunchResult{Snapshot: refreshed, SessionID: "stale"}})
+	if !model.launchPending || model.snapshot.CurrentDir != `C:\refreshed` {
 		t.Fatalf("stale launch result mutated pending launch: pending=%v snapshot=%#v", model.launchPending, model.snapshot)
 	}
 	model, _ = update(t, model, launchCmd())
@@ -692,7 +743,7 @@ func TestKAndQAreActionNoOpsAcrossDashboardPickerAndInspection(t *testing.T) {
 			model := NewModel(coordinator, time.Second)
 			model.started = true
 			model.screen = screen
-			model.snapshot = app.Snapshot{Workspace: `C:\repo`, Sessions: []core.Session{session("one"), session("two")}}
+			model.snapshot = app.Snapshot{CurrentDir: `C:\repo`, Sessions: []core.Session{session("one"), session("two")}}
 			model.selectedID = "two"
 			model.workspaceChoices = workspaceChoices(model.snapshot)
 			model.workspacePickerIndex = 1
@@ -711,7 +762,7 @@ func TestKAndQAreActionNoOpsAcrossDashboardPickerAndInspection(t *testing.T) {
 					t.Fatalf("%q mutated screen %v: cmd=%v selected=%q picker=%d inspection=%d generation=%d", name, screen, cmd, model.selectedID, model.workspacePickerIndex, model.inspectionScrollOffset, model.generation)
 				}
 			}
-			if coordinator.refreshCalls != 0 || len(coordinator.workspaceCalls) != 0 || len(coordinator.launchCalls) != 0 || len(coordinator.inspectCalls) != 0 {
+			if coordinator.refreshCalls != 0 || len(coordinator.launchCalls) != 0 || len(coordinator.inspectCalls) != 0 {
 				t.Fatalf("no-op keys called coordinator: %#v", coordinator)
 			}
 		})
@@ -1109,7 +1160,7 @@ func TestEscapeKeepsCoordinatorActionsBlockedUntilLateInitialInspectionReturns(t
 	coordinator := &stubCoordinator{}
 	model := NewModel(coordinator, time.Second)
 	model.started = true
-	model.snapshot = app.Snapshot{Workspace: `C:\repo`, Sessions: []core.Session{session("one")}}
+	model.snapshot = app.Snapshot{CurrentDir: `C:\repo`, Sessions: []core.Session{session("one")}}
 	model.selectedID = "one"
 
 	model, inspectCmd := update(t, model, key("enter"))
@@ -1129,8 +1180,8 @@ func TestEscapeKeepsCoordinatorActionsBlockedUntilLateInitialInspectionReturns(t
 		t.Fatalf("late canceled inspection mutated data: cmd=%v screen=%v tree=%#v", lateCmd, model.screen, model.inspectionTree)
 	}
 	model, launchCmd := update(t, model, key("c"))
-	if launchCmd == nil || !model.launchPending {
-		t.Fatalf("action remained blocked after matching late result: cmd=%v pending=%v", launchCmd, model.launchPending)
+	if launchCmd != nil || model.screen != screenWorkspacePicker || model.launchTool != core.ToolClaudeCLI {
+		t.Fatalf("action remained blocked after matching late result: cmd=%v screen=%v tool=%q", launchCmd, model.screen, model.launchTool)
 	}
 }
 
@@ -1290,14 +1341,14 @@ func TestInspectionRefreshesSnapshotThenSameSessionTreeAtomically(t *testing.T) 
 			newSession.Processes = []core.Process{{PID: 2}}
 			newTree := app.ProcessTree{Session: newSession, Rows: []core.ProcessTreeRow{{Process: core.Process{PID: 2}}}}
 			coordinator := &stubCoordinator{
-				refreshSnapshot: app.Snapshot{Workspace: "fresh", Sessions: []core.Session{newSession}},
+				refreshSnapshot: app.Snapshot{CurrentDir: "fresh", Sessions: []core.Session{newSession}},
 				inspectTrees:    []app.ProcessTree{newTree},
 			}
 			model := NewModel(coordinator, time.Second)
 			var ticks []tickCall
 			model.tick = fakeTick(&ticks)
 			model.started = true
-			model.snapshot = app.Snapshot{Workspace: "old", Sessions: []core.Session{session("one")}}
+			model.snapshot = app.Snapshot{CurrentDir: "old", Sessions: []core.Session{session("one")}}
 			model.selectedID = "one"
 			model.screen = screenInspection
 			model.inspectionSessionID = "one"
@@ -1318,7 +1369,7 @@ func TestInspectionRefreshesSnapshotThenSameSessionTreeAtomically(t *testing.T) 
 			if overlap != nil {
 				t.Fatal("overlapped an inspection refresh")
 			}
-			if model.snapshot.Workspace != "old" || model.inspectionTree.Rows[0].Process.PID != 1 {
+			if model.snapshot.CurrentDir != "old" || model.inspectionTree.Rows[0].Process.PID != 1 {
 				t.Fatal("model changed before the combined command completed")
 			}
 
@@ -1327,8 +1378,8 @@ func TestInspectionRefreshesSnapshotThenSameSessionTreeAtomically(t *testing.T) 
 				t.Fatalf("coordinator order = %v, want refresh then inspect:one", coordinator.events)
 			}
 			model, nextTick := update(t, model, result)
-			if model.refreshing || model.snapshot.Workspace != "fresh" || model.inspectionTree.Rows[0].Process.PID != 2 || nextTick == nil {
-				t.Fatalf("combined result: refreshing=%v workspace=%q tree=%#v next tick nil=%v", model.refreshing, model.snapshot.Workspace, model.inspectionTree, nextTick == nil)
+			if model.refreshing || model.snapshot.CurrentDir != "fresh" || model.inspectionTree.Rows[0].Process.PID != 2 || nextTick == nil {
+				t.Fatalf("combined result: refreshing=%v workspace=%q tree=%#v next tick nil=%v", model.refreshing, model.snapshot.CurrentDir, model.inspectionTree, nextTick == nil)
 			}
 		})
 	}
@@ -1336,7 +1387,7 @@ func TestInspectionRefreshesSnapshotThenSameSessionTreeAtomically(t *testing.T) 
 
 func TestInspectionRefreshKeepsScreenWhenSessionDisappears(t *testing.T) {
 	coordinator := &stubCoordinator{
-		refreshSnapshot: app.Snapshot{Workspace: "fresh"},
+		refreshSnapshot: app.Snapshot{CurrentDir: "fresh"},
 		inspectErrs:     []error{app.ErrSessionNotFound},
 	}
 	model := NewModel(coordinator, time.Second)
