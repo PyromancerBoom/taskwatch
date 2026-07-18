@@ -34,9 +34,17 @@ type Observer interface {
 	Observe(map[uint32]core.ProcessIdentity) ([]core.Session, error)
 }
 
+type warningKind uint8
+
+const (
+	warningGeneral warningKind = iota
+	warningPersistence
+)
+
 type Warning struct {
 	SessionID string
 	Message   string
+	kind      warningKind
 }
 
 type Snapshot struct {
@@ -138,13 +146,14 @@ func (coordinator *Coordinator) Launch(tool core.Tool) (LaunchResult, error) {
 	}
 	launched = cloneSession(launched)
 	coordinator.supervised = append(coordinator.supervised, launched)
-	coordinator.warnings = clearLaunchSaveWarnings(coordinator.warnings)
+	coordinator.warnings = clearPersistenceWarnings(coordinator.warnings)
 	result := LaunchResult{Snapshot: coordinator.snapshot(), SessionID: launched.ID}
 	if err := coordinator.store.Save(cloneSessions(coordinator.persistedSessions())); err != nil {
 		coordinator.persistenceDirty = true
 		coordinator.warnings = append(coordinator.warnings, Warning{
 			SessionID: launched.ID,
 			Message:   launchSaveWarningPrefix + err.Error(),
+			kind:      warningPersistence,
 		})
 		result.Snapshot = coordinator.snapshot()
 		return result, fmt.Errorf("save launched session %q: %w", launched.ID, err)
@@ -155,14 +164,15 @@ func (coordinator *Coordinator) Launch(tool core.Tool) (LaunchResult, error) {
 
 const launchSaveWarningPrefix = "save launched session: "
 
-// clearLaunchSaveWarnings drops prior "session started but could not be
-// saved" warnings. A successful Launch always retries the complete
-// supervised-session set, so any earlier such warning is now stale
-// regardless of the outcome of this launch's own save attempt.
-func clearLaunchSaveWarnings(warnings []Warning) []Warning {
+// clearPersistenceWarnings drops prior "could not save the full session
+// set" warnings. Both Refresh and Launch retry a save of the complete
+// persisted session set, so a successful save in either method makes any
+// earlier persistence-category warning stale, regardless of which method
+// produced it.
+func clearPersistenceWarnings(warnings []Warning) []Warning {
 	filtered := make([]Warning, 0, len(warnings))
 	for _, w := range warnings {
-		if strings.HasPrefix(w.Message, launchSaveWarningPrefix) {
+		if w.kind == warningPersistence {
 			continue
 		}
 		filtered = append(filtered, w)
@@ -285,7 +295,7 @@ func (coordinator *Coordinator) Refresh() Snapshot {
 	if newlyExited || coordinator.persistenceDirty {
 		if err := coordinator.store.Save(cloneSessions(coordinator.persistedSessions())); err != nil {
 			coordinator.persistenceDirty = true
-			coordinator.warnings = append(coordinator.warnings, Warning{Message: fmt.Sprintf("save reconciled sessions: %v", err)})
+			coordinator.warnings = append(coordinator.warnings, Warning{Message: fmt.Sprintf("save reconciled sessions: %v", err), kind: warningPersistence})
 		} else {
 			coordinator.persistenceDirty = false
 		}

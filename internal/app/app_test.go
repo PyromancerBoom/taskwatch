@@ -432,7 +432,7 @@ func TestRefreshNewlyExitedSavesOnlyNonExitedAndSaveFailureWarns(t *testing.T) {
 	if findSession(t, snapshot.Sessions, "active").State != core.StateExited {
 		t.Fatalf("newly exited row not retained in snapshot: %#v", snapshot.Sessions)
 	}
-	assertWarnings(t, snapshot.Warnings, []Warning{{Message: "save reconciled sessions: disk full"}})
+	assertWarnings(t, snapshot.Warnings, []Warning{{Message: "save reconciled sessions: disk full", kind: warningPersistence}})
 	if !coordinator.persistenceDirty {
 		t.Fatal("persistenceDirty = false, want true after reconciliation save failure")
 	}
@@ -453,7 +453,97 @@ func TestRefreshNewlyExitedSavesOnlyNonExitedAndSaveFailureWarns(t *testing.T) {
 	if !coordinator.persistenceDirty {
 		t.Fatal("persistenceDirty = false, want preserved after retry failure")
 	}
-	assertWarnings(t, next.Warnings, []Warning{{Message: "save reconciled sessions: disk full"}})
+	assertWarnings(t, next.Warnings, []Warning{{Message: "save reconciled sessions: disk full", kind: warningPersistence}})
+}
+
+func TestLaunchClearsStalePersistenceWarningAfterRefreshSaveFailure(t *testing.T) {
+	active := session("active", core.ConfidenceSupervised, core.StateRunning, baseTime)
+	staying := session("staying", core.ConfidenceSupervised, core.StateRunning, baseTime.Add(time.Minute))
+	exited := active
+	exited.State = core.StateExited
+	launched := session("launched", core.ConfidenceSupervised, core.StateRunning, baseTime.Add(2*time.Minute))
+	store := &fakeStore{
+		sessions: []core.Session{active, staying},
+		saveErrs: []error{
+			errors.New("disk full"), // Refresh's reconciliation save
+			nil,                     // Launch's save
+		},
+	}
+	supervisor := &fakeSupervisor{
+		recovered:   []core.Session{active, staying},
+		recoverErrs: []error{nil, nil},
+		refreshed:   [][]core.Session{{exited, staying}},
+		refreshErrs: [][]error{{nil, nil}},
+		launched:    launched,
+	}
+	observer := &fakeObserver{results: []observation{{}, {}}}
+	coordinator := newCoordinator("workspace", store, supervisor, observer, clockSequence(cycleOne, cycleTwo))
+	if _, err := coordinator.Start(); err != nil {
+		t.Fatal(err)
+	}
+
+	snapshot := coordinator.Refresh()
+	if store.saveCalls != 1 || strings.Join(ids(store.saved[0]), ",") != "staying" {
+		t.Fatalf("saved rows = %#v, want only staying in one call", store.saved)
+	}
+	assertWarnings(t, snapshot.Warnings, []Warning{{Message: "save reconciled sessions: disk full", kind: warningPersistence}})
+	if !coordinator.persistenceDirty {
+		t.Fatal("persistenceDirty = false, want true after reconciliation save failure")
+	}
+
+	result, err := coordinator.Launch(core.ToolCodexCLI)
+	if err != nil {
+		t.Fatalf("Launch() error = %v, want nil after successful save", err)
+	}
+	if coordinator.persistenceDirty {
+		t.Fatal("persistenceDirty = true, want false after successful launch save")
+	}
+	assertWarnings(t, result.Snapshot.Warnings, nil)
+	if store.saveCalls != 2 || strings.Join(ids(store.saved[1]), ",") != "staying,launched" {
+		t.Fatalf("launch save = %#v, want complete staying+launched set", store.saved)
+	}
+}
+
+func TestLaunchReplacesStalePersistenceWarningWhenItsOwnSaveAlsoFails(t *testing.T) {
+	active := session("active", core.ConfidenceSupervised, core.StateRunning, baseTime)
+	staying := session("staying", core.ConfidenceSupervised, core.StateRunning, baseTime.Add(time.Minute))
+	exited := active
+	exited.State = core.StateExited
+	launched := session("launched", core.ConfidenceSupervised, core.StateRunning, baseTime.Add(2*time.Minute))
+	launchSaveErr := errors.New("still full")
+	store := &fakeStore{
+		sessions: []core.Session{active, staying},
+		saveErrs: []error{
+			errors.New("disk full"), // Refresh's reconciliation save
+			launchSaveErr,           // Launch's save
+		},
+	}
+	supervisor := &fakeSupervisor{
+		recovered:   []core.Session{active, staying},
+		recoverErrs: []error{nil, nil},
+		refreshed:   [][]core.Session{{exited, staying}},
+		refreshErrs: [][]error{{nil, nil}},
+		launched:    launched,
+	}
+	observer := &fakeObserver{results: []observation{{}, {}}}
+	coordinator := newCoordinator("workspace", store, supervisor, observer, clockSequence(cycleOne, cycleTwo))
+	if _, err := coordinator.Start(); err != nil {
+		t.Fatal(err)
+	}
+	if snapshot := coordinator.Refresh(); !coordinator.persistenceDirty {
+		t.Fatalf("persistenceDirty = false, want true after reconciliation save failure; warnings = %#v", snapshot.Warnings)
+	}
+
+	result, err := coordinator.Launch(core.ToolCodexCLI)
+	if !errors.Is(err, launchSaveErr) {
+		t.Fatalf("Launch() error = %v, want wrapped %v", err, launchSaveErr)
+	}
+	if !coordinator.persistenceDirty {
+		t.Fatal("persistenceDirty = false, want true after launch save failure")
+	}
+	if len(result.Snapshot.Warnings) != 1 || result.Snapshot.Warnings[0].SessionID != "launched" || !strings.Contains(result.Snapshot.Warnings[0].Message, "still full") {
+		t.Fatalf("warnings = %#v, want single launch-save warning replacing the stale reconciliation warning", result.Snapshot.Warnings)
+	}
 }
 
 func TestRefreshDirtyPersistenceRetriesWithoutNewExitAndClearsOnSuccess(t *testing.T) {
@@ -506,7 +596,7 @@ func TestRefreshDirtyPersistenceFailedRetryPreservesDirtyAndWarns(t *testing.T) 
 	if store.saveCalls != 2 || !coordinator.persistenceDirty {
 		t.Fatalf("saveCalls/persistenceDirty = %d/%v, want 2/true", store.saveCalls, coordinator.persistenceDirty)
 	}
-	assertWarnings(t, got.Warnings, []Warning{{Message: "save reconciled sessions: retry still full"}})
+	assertWarnings(t, got.Warnings, []Warning{{Message: "save reconciled sessions: retry still full", kind: warningPersistence}})
 }
 
 func TestSnapshotsAreDeepCopies(t *testing.T) {
