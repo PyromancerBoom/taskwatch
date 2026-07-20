@@ -30,6 +30,7 @@ func (resolver *fakeResolver) LookPath(name string) (string, error) {
 type fakeNative struct {
 	events             []string
 	failAssign         bool
+	failDuplicate      bool
 	jobPIDs            []uint32
 	jobHandles         map[string]nativeHandle
 	openJobErrors      map[string]error
@@ -66,6 +67,13 @@ func (native *fakeNative) assignProcess(nativeHandle, nativeHandle) error {
 	native.events = append(native.events, "assign")
 	if native.failAssign {
 		return errors.New("assign failed")
+	}
+	return nil
+}
+func (native *fakeNative) duplicateJobHandleIntoProcess(nativeHandle, nativeHandle) error {
+	native.events = append(native.events, "duplicate-job-handle")
+	if native.failDuplicate {
+		return errors.New("duplicate failed")
 	}
 	return nil
 }
@@ -115,6 +123,27 @@ type fakeSnapshotter struct {
 	calls     int
 }
 
+func TestCurrentProcessIdentityMatchesSnapshot(t *testing.T) {
+	identity, err := CurrentProcessIdentity()
+	if err != nil {
+		t.Fatalf("CurrentProcessIdentity() error = %v", err)
+	}
+
+	snapshot, err := NewProcessSnapshotter().Snapshot()
+	if err != nil {
+		t.Fatalf("Snapshot() error = %v", err)
+	}
+	for _, detail := range snapshot {
+		if detail.Process.PID == identity.PID {
+			if got := detail.Process.Identity(); got != identity {
+				t.Fatalf("snapshot identity = %#v, want %#v", got, identity)
+			}
+			return
+		}
+	}
+	t.Fatalf("current PID %d missing from snapshot", identity.PID)
+}
+
 func (snapshotter *fakeSnapshotter) Snapshot() ([]ProcessDetails, error) {
 	snapshotter.calls++
 	return append([]ProcessDetails(nil), snapshotter.processes...), snapshotter.err
@@ -136,6 +165,9 @@ func TestLaunchResolvesOnlySupportedToolAndAssignsBeforeResume(t *testing.T) {
 	if index(native.events, "assign") > index(native.events, "resume") {
 		t.Fatalf("native events = %v, assignment must precede resume", native.events)
 	}
+	if index(native.events, "assign") > index(native.events, "duplicate-job-handle") || index(native.events, "duplicate-job-handle") > index(native.events, "resume") {
+		t.Fatalf("native events = %v, job handle must be retained after assignment and before resume", native.events)
+	}
 	if session.Tool != core.ToolCodexCLI || session.Root.PID != 42 || !session.Root.CreatedAt.Equal(created) || session.Confidence != core.ConfidenceSupervised {
 		t.Fatalf("Launch() session = %#v", session)
 	}
@@ -148,6 +180,19 @@ func TestLaunchAssignmentFailureTerminatesSuspendedProcess(t *testing.T) {
 
 	if _, err := supervisor.Launch(core.ToolClaudeCLI, `C:\work`); err == nil {
 		t.Fatal("Launch() accepted failed job assignment")
+	}
+	if index(native.events, "terminate-suspended") == -1 || index(native.events, "resume") != -1 {
+		t.Fatalf("native events = %v, want suspended process terminated and never resumed", native.events)
+	}
+}
+
+func TestLaunchJobHandleDuplicationFailureTerminatesSuspendedProcess(t *testing.T) {
+	resolver := &fakeResolver{paths: map[string]string{"claude": `C:\tools\claude.exe`}}
+	native := &fakeNative{failDuplicate: true, createdAt: time.Unix(100, 0).UTC()}
+	supervisor := newSupervisor(resolver, native, &fakeSnapshotter{})
+
+	if _, err := supervisor.Launch(core.ToolClaudeCLI, `C:\work`); err == nil {
+		t.Fatal("Launch() accepted failed job-handle duplication")
 	}
 	if index(native.events, "terminate-suspended") == -1 || index(native.events, "resume") != -1 {
 		t.Fatalf("native events = %v, want suspended process terminated and never resumed", native.events)

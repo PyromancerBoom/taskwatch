@@ -11,6 +11,8 @@ import (
 	"unsafe"
 
 	winapi "golang.org/x/sys/windows"
+
+	"taskwatch/internal/core"
 )
 
 const (
@@ -27,6 +29,21 @@ var (
 )
 
 type nativeWindows struct{}
+
+func CurrentProcessIdentity() (core.ProcessIdentity, error) {
+	pid := winapi.GetCurrentProcessId()
+	if pid == 0 {
+		return core.ProcessIdentity{}, errors.New("current process PID is zero")
+	}
+	createdAt, err := (nativeWindows{}).processCreatedAt(nativeHandle(winapi.CurrentProcess()))
+	if err != nil {
+		return core.ProcessIdentity{}, fmt.Errorf("read current process creation time: %w", err)
+	}
+	if createdAt.IsZero() {
+		return core.ProcessIdentity{}, errors.New("current process creation time is zero")
+	}
+	return core.ProcessIdentity{PID: pid, CreatedAt: createdAt}, nil
+}
 
 func (nativeWindows) createJob(name string) (nativeHandle, error) {
 	namePointer, err := winapi.UTF16PtrFromString(name)
@@ -105,6 +122,23 @@ func quoteWindowsArgument(value string) string {
 
 func (nativeWindows) assignProcess(job, process nativeHandle) error {
 	return winapi.AssignProcessToJobObject(winapi.Handle(job), winapi.Handle(process))
+}
+
+// duplicateJobHandleIntoProcess gives the suspended root a non-inheritable
+// handle to its own named job. That keeps the kernel object open if TaskWatch
+// exits, allowing a restarted TaskWatch to reopen it while the root still
+// lives. The remote handle closes automatically when the root exits.
+func (nativeWindows) duplicateJobHandleIntoProcess(job, process nativeHandle) error {
+	var remoteHandle winapi.Handle
+	return winapi.DuplicateHandle(
+		winapi.CurrentProcess(),
+		winapi.Handle(job),
+		winapi.Handle(process),
+		&remoteHandle,
+		0,
+		false,
+		winapi.DUPLICATE_SAME_ACCESS,
+	)
 }
 
 func (nativeWindows) resumeThread(thread nativeHandle) error {

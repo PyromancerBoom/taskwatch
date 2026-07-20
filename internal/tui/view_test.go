@@ -52,10 +52,10 @@ func detailedSession() core.Session {
 func TestFullRenderingShowsHeaderEveryColumnAndFooter(t *testing.T) {
 	content := testModel(130, []core.Session{detailedSession()}).View().Content
 	for _, want := range []string{
-		"TASKWATCH", "● LIVE · 03:04:05",
+		"TASKWATCH", "READ-ONLY PREVIEW", "● LIVE · 03:04:05",
 		"APP", "TRACKING", "STATUS", "PROCESSES", "CPU", "MEMORY", "AGE", "FOLDER",
-		"Codex CLI", "managed", "running", "2", "12.3%", "1.5 MB", "2h", `C:\repo`,
-		"Enter inspect", "c/x launch", "r refresh", "↑/↓ move", "Ctrl+C close",
+		"Codex CLI", "supervised", "running", "2", "12.3%", "1.5 MB", "2h", `C:\repo`,
+		"No termination keys", "Enter inspect", "c/x launch", "r refresh", "↑/↓ move", "Ctrl+C close",
 	} {
 		if !strings.Contains(content, want) {
 			t.Errorf("full view missing %q:\n%s", want, content)
@@ -99,7 +99,7 @@ func TestDashboardFooterAdvertisesOnlyScopedActionsAcrossWidths(t *testing.T) {
 func TestMediumAndNarrowRenderingKeepRequiredFieldsAndFolder(t *testing.T) {
 	for _, width := range []int{90, 60} {
 		content := testModel(width, []core.Session{detailedSession()}).View().Content
-		for _, want := range []string{"Codex CLI", "managed", "running", "2", "12.3%", "1.5 MB", "2h", `C:\repo`} {
+		for _, want := range []string{"Codex CLI", "supervised", "running", "2", "12.3%", "1.5 MB", "2h", `C:\repo`} {
 			if !strings.Contains(content, want) {
 				t.Errorf("width %d missing %q:\n%s", width, want, content)
 			}
@@ -156,8 +156,8 @@ func TestBelowMinimumWidthShowsResizeMessageInEveryState(t *testing.T) {
 
 // TestNarrowEmptyCopyWrapsWithoutLosingText was adapted for the friendlier
 // empty-state copy: a short headline plus a muted body line. The exact
-// wording changed, but the two facts it must convey (watches for Codex
-// Desktop, refreshes every 2 seconds) are still asserted verbatim.
+// wording changed, but the limitations it must convey are still asserted
+// verbatim after wrapping.
 func TestNarrowEmptyCopyWrapsWithoutLosingText(t *testing.T) {
 	const width = 40
 	content := testModel(width, nil).View().Content
@@ -167,8 +167,68 @@ func TestNarrowEmptyCopyWrapsWithoutLosingText(t *testing.T) {
 	if !strings.Contains(plain, "No sessions yet") {
 		t.Fatalf("width-%d empty view lost headline:\n%s", width, content)
 	}
-	if !strings.Contains(plain, "Watching for Codex Desktop. Refreshing every 2 seconds.") {
+	if !strings.Contains(plain, "Codex Desktop is watched as one application/process tree. Claude and Codex CLI sessions are shown only when launched through TaskWatch. Refreshing every 2 seconds.") {
 		t.Fatalf("width-%d empty view lost body copy:\n%s", width, content)
+	}
+}
+
+func TestPreviewHeaderAppearsOnEveryNormalScreenAcrossWidths(t *testing.T) {
+	for _, width := range []int{40, 90, 130} {
+		for _, screen := range []screenState{screenDashboard, screenWorkspacePicker, screenWorkspaceEditor, screenInspection} {
+			t.Run(fmt.Sprintf("width_%d_screen_%d", width, screen), func(t *testing.T) {
+				model := testModel(width, []core.Session{detailedSession()})
+				model.height = 24
+				model.screen = screen
+				model.inspectionTree = app.ProcessTree{Session: detailedSession()}
+
+				content := model.View().Content
+				if !strings.Contains(flattenRendered(content), "READ-ONLY PREVIEW") {
+					t.Fatalf("normal screen missing read-only preview header at width %d:\n%s", width, content)
+				}
+				assertWithinWidth(t, content, width)
+				if got := len(strings.Split(content, "\n")); got > model.height {
+					t.Fatalf("normal screen rendered %d lines, want <= %d:\n%s", got, model.height, content)
+				}
+			})
+		}
+	}
+}
+
+func TestReadOnlyPreviewSurvivesStartupAndTightFallbacks(t *testing.T) {
+	tests := map[string]Model{
+		"tiny normal screen": func() Model {
+			model := testModel(minimumTerminalWidth, []core.Session{detailedSession()})
+			model.height = 2
+			return model
+		}(),
+		"loading screen": func() Model {
+			model := testModel(40, nil)
+			model.started = false
+			return model
+		}(),
+		"startup error": func() Model {
+			model := testModel(40, nil)
+			model.startupErr = errors.New("blocked")
+			return model
+		}(),
+		"below minimum width": testModel(minimumTerminalWidth-1, nil),
+	}
+
+	for name, model := range tests {
+		t.Run(name, func(t *testing.T) {
+			content := model.View().Content
+			if !strings.Contains(flattenRendered(content), "READ-ONLY PREVIEW") {
+				t.Fatalf("screen missing read-only preview marker:\n%s", content)
+			}
+			assertWithinWidth(t, content, model.width)
+			height := model.height
+			if height < 1 {
+				height = 24
+			}
+			if got := len(strings.Split(content, "\n")); got > height {
+				t.Fatalf("screen rendered %d lines, want <= %d:\n%s", got, height, content)
+			}
+		})
 	}
 }
 
@@ -346,7 +406,8 @@ func TestNarrowLongWarningKeepsMoreSuffixVisible(t *testing.T) {
 
 func TestEmptyAndBlockingErrorCopy(t *testing.T) {
 	empty := testModel(100, nil).View().Content
-	if !strings.Contains(empty, "No sessions yet") || !strings.Contains(empty, "Watching for Codex Desktop. Refreshing every 2 seconds.") {
+	emptyPlain := flattenRendered(empty)
+	if !strings.Contains(emptyPlain, "No sessions yet") || !strings.Contains(emptyPlain, "Codex Desktop is watched as one application/process tree. Claude and Codex CLI sessions are shown only when launched through TaskWatch. Refreshing every 2 seconds.") {
 		t.Fatalf("empty view missing exact copy:\n%s", empty)
 	}
 
@@ -686,7 +747,7 @@ func TestDetailPanelShowsSelectedSessionFieldsAtTallHeight(t *testing.T) {
 	plain := flattenRendered(content)
 	for _, want := range []string{
 		"Selected Session",
-		"Tool: ", "Codex CLI · managed",
+		"Tool: ", "Codex CLI · supervised",
 		"State: ", "running",
 		"Workspace: ", `C:\repo`,
 		"Root PID: ", "0",
@@ -814,7 +875,7 @@ func TestInspectionWideAndNarrowViewsShowContextAndProcessFields(t *testing.T) {
 			plain := flattenRendered(content)
 
 			for _, want := range []string{
-				"Process Tree", "Codex CLI", "managed", "running", `C:\repo\inspected`,
+				"Process Tree", "Codex CLI", "supervised", "running", `C:\repo\inspected`,
 				"language-server", "4242", "4000", "01:02:03", "7.5%", "1.5 MB",
 			} {
 				if !strings.Contains(plain, want) {
@@ -823,6 +884,20 @@ func TestInspectionWideAndNarrowViewsShowContextAndProcessFields(t *testing.T) {
 			}
 			assertWithinWidth(t, content, width)
 		})
+	}
+}
+
+func TestCodexDesktopInspectionIsLabeledAsApplicationTree(t *testing.T) {
+	tree := inspectionTreeWithRows(nil)
+	tree.Session.Tool = core.ToolCodexDesktop
+	content := inspectionTestModel(90, 16, tree, nil, false).View().Content
+	plain := flattenRendered(content)
+
+	if !strings.Contains(plain, "Codex Desktop application tree") {
+		t.Fatalf("Codex Desktop inspection is not labeled as an application tree:\n%s", content)
+	}
+	if got := toolLabel(core.ToolCodexDesktop); got != "Codex Desktop" {
+		t.Fatalf("underlying launch-context tool label = %q, want %q", got, "Codex Desktop")
 	}
 }
 
@@ -942,7 +1017,7 @@ func TestInspectionResizeMatrixCapsWidthHeightAndKeepsFooterLast(t *testing.T) {
 func TestInspectionFooterAdvertisesOnlyReadOnlyInspectionKeys(t *testing.T) {
 	content := inspectionTestModel(130, 20, inspectionTreeWithRows(nil), nil, false).View().Content
 	plain := flattenRendered(content)
-	for _, want := range []string{"↑/↓", "PgUp/PgDn", "r refresh", "Enter/Esc back", "Ctrl+C"} {
+	for _, want := range []string{"No termination keys", "↑/↓", "PgUp/PgDn", "r refresh", "Enter/Esc back", "Ctrl+C"} {
 		if !strings.Contains(plain, want) {
 			t.Fatalf("inspection footer missing %q:\n%s", want, content)
 		}

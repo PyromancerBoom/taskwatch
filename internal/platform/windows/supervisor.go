@@ -29,6 +29,7 @@ type nativeOperations interface {
 	openJob(name string) (nativeHandle, error)
 	createSuspended(executable, workspace string) (process, thread nativeHandle, pid uint32, err error)
 	assignProcess(job, process nativeHandle) error
+	duplicateJobHandleIntoProcess(job, process nativeHandle) error
 	resumeThread(thread nativeHandle) error
 	processCreatedAt(process nativeHandle) (time.Time, error)
 	terminateProcess(process nativeHandle) error
@@ -106,6 +107,9 @@ func (supervisor *Supervisor) Launch(tool core.Tool, workspace string) (core.Ses
 	}
 	if err := supervisor.native.assignProcess(job, process); err != nil {
 		return core.Session{}, fmt.Errorf("assign suspended process to job: %w", err)
+	}
+	if err := supervisor.native.duplicateJobHandleIntoProcess(job, process); err != nil {
+		return core.Session{}, fmt.Errorf("retain job for restart recovery: %w", err)
 	}
 	if err := supervisor.native.resumeThread(thread); err != nil {
 		return core.Session{}, fmt.Errorf("resume supervised process: %w", err)

@@ -91,17 +91,12 @@ func TestGroupCodexDesktopDoesNotSuppressOlderRootBehindReusedNewerParentPID(t *
 	}
 }
 
-func TestGroupCodexDesktopIgnoresInvalidEdgesWhenDerivingInaccessibleState(t *testing.T) {
+func TestGroupCodexDesktopIgnoresKnownOlderChildWhenDerivingInaccessibleState(t *testing.T) {
 	created := time.Unix(200, 0).UTC()
 	processes := []ProcessDetails{
 		{Process: core.Process{PID: 20, ParentPID: 1, Name: "Codex.exe", CreatedAt: created}, ExecutablePath: packagedCodexDesktopPath, MetadataAccessible: true},
 		{
 			Process:            core.Process{PID: 10, ParentPID: 20, Name: "older-unrelated.exe", CreatedAt: created.Add(-time.Hour)},
-			MetadataAccessible: false,
-			MetadataError:      "access denied",
-		},
-		{
-			Process:            core.Process{PID: 11, ParentPID: 20, Name: "identityless-unrelated.exe"},
 			MetadataAccessible: false,
 			MetadataError:      "access denied",
 		},
@@ -116,6 +111,30 @@ func TestGroupCodexDesktopIgnoresInvalidEdgesWhenDerivingInaccessibleState(t *te
 	}
 	if len(got[0].Processes) != 1 || got[0].Processes[0].PID != 20 {
 		t.Fatalf("safe processes = %#v, want only root PID 20", got[0].Processes)
+	}
+}
+
+func TestGroupCodexDesktopMarksIdentitylessChildOfSafeDescendantInaccessible(t *testing.T) {
+	created := time.Unix(200, 0).UTC()
+	processes := []ProcessDetails{
+		{Process: core.Process{PID: 20, ParentPID: 1, Name: "Codex.exe", CreatedAt: created}, ExecutablePath: packagedCodexDesktopPath, MetadataAccessible: true},
+		{Process: core.Process{PID: 21, ParentPID: 20, Name: "renderer.exe", CreatedAt: created.Add(time.Second)}, MetadataAccessible: true},
+		{
+			Process:            core.Process{PID: 22, ParentPID: 21, Name: "unknown.exe"},
+			MetadataAccessible: false,
+			MetadataError:      "creation time unavailable",
+		},
+	}
+
+	got := GroupCodexDesktop(processes, nil)
+	if len(got) != 1 {
+		t.Fatalf("GroupCodexDesktop() returned %d sessions, want 1", len(got))
+	}
+	if got[0].State != core.StateInaccessible {
+		t.Fatalf("session state = %q, want inaccessible", got[0].State)
+	}
+	if len(got[0].Processes) != 2 || got[0].Processes[0].PID != 20 || got[0].Processes[1].PID != 21 {
+		t.Fatalf("safe processes = %#v, want only root PID 20 and renderer PID 21", got[0].Processes)
 	}
 }
 

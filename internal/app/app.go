@@ -75,6 +75,7 @@ type Coordinator struct {
 	store            SessionStore
 	supervisor       Supervisor
 	observer         Observer
+	selfIdentity     core.ProcessIdentity
 	now              func() time.Time
 	resolveWorkspace func(string, string) (string, error)
 	supervised       []core.Session
@@ -88,8 +89,10 @@ type Coordinator struct {
 // maxRecentWorkspaces caps the persisted recent-workspaces list.
 const maxRecentWorkspaces = 8
 
-func NewCoordinator(baseDir string, store SessionStore, supervisor Supervisor, observer Observer) *Coordinator {
-	return newCoordinator(baseDir, store, supervisor, observer, time.Now)
+func NewCoordinator(baseDir string, store SessionStore, supervisor Supervisor, observer Observer, selfIdentity core.ProcessIdentity) *Coordinator {
+	coordinator := newCoordinator(baseDir, store, supervisor, observer, time.Now)
+	coordinator.selfIdentity = selfIdentity
+	return coordinator
 }
 
 func newCoordinator(baseDir string, store SessionStore, supervisor Supervisor, observer Observer, now func() time.Time) *Coordinator {
@@ -389,6 +392,9 @@ func (coordinator *Coordinator) exclusions() map[uint32]core.ProcessIdentity {
 		for _, process := range session.Processes {
 			excluded[process.PID] = process.Identity()
 		}
+	}
+	if coordinator.selfIdentity.PID != 0 && !coordinator.selfIdentity.CreatedAt.IsZero() {
+		excluded[coordinator.selfIdentity.PID] = coordinator.selfIdentity
 	}
 	return excluded
 }

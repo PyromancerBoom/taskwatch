@@ -184,6 +184,46 @@ func TestStartEmptyStoreObservesWithoutRecoveryOrSave(t *testing.T) {
 	assertSnapshot(t, snapshot, "C:/work", []string{"desktop"}, nil, cycleOne)
 }
 
+func TestStartPassesOnlyValidSelfIdentityToObserver(t *testing.T) {
+	tests := []struct {
+		name string
+		self core.ProcessIdentity
+		want map[uint32]core.ProcessIdentity
+	}{
+		{name: "valid", self: core.ProcessIdentity{PID: 42, CreatedAt: baseTime}, want: map[uint32]core.ProcessIdentity{42: {PID: 42, CreatedAt: baseTime}}},
+		{name: "zero", self: core.ProcessIdentity{}, want: map[uint32]core.ProcessIdentity{}},
+		{name: "missing creation time", self: core.ProcessIdentity{PID: 42}, want: map[uint32]core.ProcessIdentity{}},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			observer := &fakeObserver{results: []observation{{}}}
+			coordinator := NewCoordinator("workspace", &fakeStore{}, &fakeSupervisor{}, observer, test.self)
+
+			if _, err := coordinator.Start(); err != nil {
+				t.Fatalf("Start() error = %v", err)
+			}
+			if len(observer.calls) != 1 || !sameIdentities(observer.calls[0], test.want) {
+				t.Fatalf("Observe exclusions = %#v, want %#v", observer.calls, test.want)
+			}
+		})
+	}
+}
+
+func TestExclusionsRetainsSelfIdentityWhenSupervisedPIDCollides(t *testing.T) {
+	self := core.ProcessIdentity{PID: 42, CreatedAt: baseTime}
+	coordinator := &Coordinator{
+		selfIdentity: self,
+		supervised: []core.Session{{
+			Processes: []core.Process{{PID: self.PID, CreatedAt: baseTime.Add(-time.Minute)}},
+		}},
+	}
+
+	if got := coordinator.exclusions()[self.PID]; got != self {
+		t.Fatalf("self exclusion = %#v, want %#v", got, self)
+	}
+}
+
 func TestStartMissingFileObservesWithoutCreatingStateFile(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "missing", "state.json")
 	supervisor := &fakeSupervisor{}
@@ -1145,7 +1185,7 @@ func TestInspectAfterCloseReturnsCoordinatorClosedErrorAndZeroTree(t *testing.T)
 
 func TestCloseDelegatesToSupervisor(t *testing.T) {
 	supervisor := &fakeSupervisor{}
-	coordinator := NewCoordinator("workspace", &fakeStore{}, supervisor, &fakeObserver{})
+	coordinator := NewCoordinator("workspace", &fakeStore{}, supervisor, &fakeObserver{}, core.ProcessIdentity{})
 
 	coordinator.Close()
 

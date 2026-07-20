@@ -98,6 +98,15 @@ func observedTreeInaccessible(rootPID uint32, detailsByPID map[uint32]ProcessDet
 			return true
 		}
 		for childPID, child := range detailsByPID {
+			if child.Process.ParentPID != detail.Process.PID {
+				continue
+			}
+			if !child.Process.CreatedAt.IsZero() && child.Process.CreatedAt.Before(detail.Process.CreatedAt) {
+				continue
+			}
+			if child.Process.CreatedAt.IsZero() {
+				return true
+			}
 			if validObservedEdge(detail.Process, child.Process) {
 				queue = append(queue, childPID)
 			}

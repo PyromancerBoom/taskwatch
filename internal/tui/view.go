@@ -16,6 +16,7 @@ import (
 // brand is the application wordmark shown in the header. It stays contiguous
 // with the workspace and status that follow it so the header reads as one line.
 const brand = "TASKWATCH"
+const previewLabel = "READ-ONLY PREVIEW"
 
 const minimumTerminalWidth = 25
 
@@ -25,13 +26,13 @@ const minimumTerminalWidth = 25
 // planLayout). This trades footer wrapping for legibility of the key hints at
 // every width, including the narrowest supported one.
 var footerHints = []string{
-	"Enter inspect • c/x launch • r refresh • ↑/↓ move • Ctrl+C close",
+	"No termination keys • Enter inspect • c/x launch • r refresh • ↑/↓ move • Ctrl+C close",
 	"Enter inspect • c/x • r • ↑↓ • ^C",
 	"Enter c/x r ↑↓ ^C",
 }
 
 var inspectionFooterHints = []string{
-	"↑/↓ scroll  •  PgUp/PgDn page  •  r refresh  •  Enter/Esc back  •  Ctrl+C close",
+	"No termination keys • ↑/↓ scroll • PgUp/PgDn page • r refresh • Enter/Esc back • Ctrl+C close",
 	"↑/↓ scroll • PgUp/PgDn • r refresh • Enter/Esc back • ^C close",
 	"↑↓ • r • Enter/Esc • ^C",
 }
@@ -167,19 +168,24 @@ func (m Model) statusChipStyle() lipgloss.Style {
 // segment) and the model's viewport bookkeeping (which only needs the line
 // count), so both agree on how many lines the header actually costs.
 //
-// The header carries only the brand chip and the status: there is no global
+// The header carries the brand chip, read-only preview marker, and status: there is no global
 // "active workspace" anymore — a workspace is chosen per launch — so nothing
-// in the header implies a mutable launch target. The brand and status share
-// one line when they fit; otherwise they drop to two lines.
+// in the header implies a mutable launch target. All three share one line
+// when they fit, with compact wrapped variants at narrower widths.
 func (m Model) headerLineTexts(width int) []string {
 	chip := " " + brand + " "
+	preview := previewLabel
 	status := m.statusChipText()
 
-	oneLine := chip + "  " + status
+	oneLine := chip + "  " + preview + "  " + status
 	if lipgloss.Width(oneLine) <= width {
 		return []string{oneLine}
 	}
-	return []string{chip, status}
+	brandPreview := chip + "  " + preview
+	if lipgloss.Width(brandPreview) <= width {
+		return []string{brandPreview, status}
+	}
+	return []string{chip, preview, status}
 }
 
 // headerLines renders the styled header: the brand as a colored chip and the
@@ -189,32 +195,25 @@ func (m Model) headerLineTexts(width int) []string {
 // after clipping falls back to a muted, fully clipped plain line.
 func (m Model) headerLines(width int) []string {
 	chipPlain := " " + brand + " "
+	previewPlain := previewLabel
 	statusPlain := m.statusChipText()
 	statusStyle := m.statusChipStyle()
 
-	renderLine := func(plainLine string, includeChip, includeStatus bool) string {
-		if lipgloss.Width(plainLine) > width {
-			return m.palette.muted.Render(clip(plainLine, width))
-		}
-		if includeChip && includeStatus {
-			// One-line layout: chip + "  " + status.
-			return m.palette.brand.Render(chipPlain) + m.palette.text.Render("  ") + statusStyle.Render(statusPlain)
-		}
-		if includeChip {
-			return m.palette.brand.Render(chipPlain)
-		}
-		return statusStyle.Render(statusPlain)
-	}
-
 	texts := m.headerLineTexts(width)
-	lines := make([]string, len(texts))
 	if len(texts) == 1 {
-		lines[0] = renderLine(texts[0], true, true)
-		return lines
+		return []string{m.palette.brand.Render(chipPlain) + m.palette.text.Render("  ") + m.palette.warning.Render(previewPlain) + m.palette.text.Render("  ") + statusStyle.Render(statusPlain)}
 	}
-	lines[0] = renderLine(texts[0], true, false)
-	lines[1] = renderLine(texts[1], false, true)
-	return lines
+	if len(texts) == 2 {
+		return []string{
+			m.palette.brand.Render(chipPlain) + m.palette.text.Render("  ") + m.palette.warning.Render(previewPlain),
+			statusStyle.Render(statusPlain),
+		}
+	}
+	return []string{
+		m.palette.brand.Render(clip(chipPlain, width)),
+		m.palette.warning.Render(clip(previewPlain, width)),
+		statusStyle.Render(clip(statusPlain, width)),
+	}
 }
 
 // truncateHeaderLines caps the header at height-1 lines, reserving the last
@@ -227,6 +226,13 @@ func truncateHeaderLines(lines []string, height int) []string {
 		return nil
 	}
 	if len(lines) > maxHeaderLines {
+		if maxHeaderLines == 1 {
+			for _, line := range lines {
+				if strings.Contains(line, previewLabel) {
+					return []string{line}
+				}
+			}
+		}
 		return lines[:maxHeaderLines]
 	}
 	return lines
@@ -415,7 +421,10 @@ func (m Model) render() string {
 	}
 	if width < minimumTerminalWidth {
 		message := fmt.Sprintf("Window too narrow - resize to at least %d columns", minimumTerminalWidth)
-		return m.palette.warning.Render(clip(message, width))
+		return capLines([]string{
+			m.palette.warning.Render(clip(message, width)),
+			m.palette.warning.Render(clip(previewLabel, width)),
+		}, height)
 	}
 	if m.startupErr != nil {
 		return capLines(m.renderStartupError(width), height)
@@ -695,13 +704,17 @@ func (m Model) inspectionSession() core.Session {
 func (m Model) inspectionContextLines(width int) []string {
 	session := m.inspectionSession()
 	title := "Process Tree"
-	metadata := toolLabel(session.Tool) + " · " + trackingLabel(session.Confidence) + " · " + string(session.State)
+	inspectionTool := toolLabel(session.Tool)
+	if session.Tool == core.ToolCodexDesktop {
+		inspectionTool += " application tree"
+	}
+	metadata := inspectionTool + " · " + trackingLabel(session.Confidence) + " · " + string(session.State)
 	firstPlain := title + "  " + metadata
 	var first string
 	if lipgloss.Width(firstPlain) > width {
 		first = m.palette.muted.Render(clip(firstPlain, width))
 	} else {
-		first = m.palette.focus.Render(title) + m.palette.muted.Render("  "+toolLabel(session.Tool)+" · "+trackingLabel(session.Confidence)+" · ") + m.stateStyle(session.State).Render(string(session.State))
+		first = m.palette.focus.Render(title) + m.palette.muted.Render("  "+inspectionTool+" · "+trackingLabel(session.Confidence)+" · ") + m.stateStyle(session.State).Render(string(session.State))
 	}
 
 	workspace := folder(session)
@@ -869,7 +882,8 @@ func (m Model) renderStartupError(width int) []string {
 		Border(lipgloss.RoundedBorder()).
 		BorderForeground(m.palette.failure.GetForeground()).
 		Padding(0, 1)
-	lines := strings.Split(panel.Render(strings.Join(body, "\n")), "\n")
+	lines := []string{m.palette.warning.Render(clip(previewLabel, width))}
+	lines = append(lines, strings.Split(panel.Render(strings.Join(body, "\n")), "\n")...)
 	lines = append(lines, m.palette.muted.Render(clip("Ctrl+C close (apps keep running)", width)))
 	return lines
 }
@@ -879,9 +893,11 @@ func (m Model) renderStartupError(width int) []string {
 // the top-left corner. No timers or animation: this is a static screen.
 func (m Model) renderLoading(width, height int) []string {
 	brandLine := m.palette.brand.Render(clip(" "+brand+" ", width))
+	previewLine := m.palette.warning.Render(clip(previewLabel, width))
 	startingLine := m.palette.muted.Render(clip("Starting TaskWatch…", width))
 	lines := []string{
 		centerLine(brandLine, width),
+		centerLine(previewLine, width),
 		"",
 		centerLine(startingLine, width),
 	}
@@ -940,7 +956,7 @@ func (m Model) renderViewport(width int, plan layoutPlan) []string {
 	sessions := m.snapshot.Sessions
 	if len(sessions) == 0 {
 		body = renderWrapped(m.palette.text, "No sessions yet", width)
-		body = append(body, renderWrapped(m.palette.muted, "Watching for Codex Desktop. Refreshing every 2 seconds.", width)...)
+		body = append(body, renderWrapped(m.palette.muted, "Codex Desktop is watched as one application/process tree. Claude and Codex CLI sessions are shown only when launched through TaskWatch. Refreshing every 2 seconds.", width)...)
 	} else {
 		start, end, showAbove, showBelow := sessionWindow(len(sessions), m.scrollOffset, plan.viewportLines, plan.rowsPerSession)
 
@@ -1090,21 +1106,21 @@ func wrapDisplayWidth(value string, width int) []string {
 }
 
 func fullHeading() string {
-	return fmt.Sprintf("  %-13s %-8s %-12s %-9s %-12s %-10s %-5s %s", "APP", "TRACKING", "STATUS", "PROCESSES", "CPU", "WS MEMORY", "AGE", "FOLDER")
+	return fmt.Sprintf("  %-13s %-10s %-12s %-9s %-12s %-10s %-5s %s", "APP", "TRACKING", "STATUS", "PROCESSES", "CPU", "WS MEMORY", "AGE", "FOLDER")
 }
 
 func fullRow(session core.Session, now time.Time) string {
-	return fmt.Sprintf("  %-13s %-8s %-12s %-9d %-12s %-10s %-5s %s",
+	return fmt.Sprintf("  %-13s %-10s %-12s %-9d %-12s %-10s %-5s %s",
 		toolLabel(session.Tool), trackingLabel(session.Confidence), string(session.State), len(session.Processes),
 		cpuCell(session), memoryLabel(session.Resources), ageLabel(session.StartedAt, now), folder(session))
 }
 
 func mediumHeading() string {
-	return fmt.Sprintf("  %-13s %-8s %-12s %-4s %-12s %-9s %-4s", "APP", "TRACKING", "STATUS", "PROC", "CPU", "WS MEMORY", "AGE")
+	return fmt.Sprintf("  %-13s %-10s %-12s %-4s %-12s %-9s %-4s", "APP", "TRACKING", "STATUS", "PROC", "CPU", "WS MEMORY", "AGE")
 }
 
 func mediumRow(session core.Session, now time.Time) string {
-	return fmt.Sprintf("  %-13s %-8s %-12s %-4d %-12s %-9s %-4s",
+	return fmt.Sprintf("  %-13s %-10s %-12s %-4d %-12s %-9s %-4s",
 		toolLabel(session.Tool), trackingLabel(session.Confidence), string(session.State), len(session.Processes),
 		cpuCell(session), memoryLabel(session.Resources), ageLabel(session.StartedAt, now))
 }
@@ -1309,7 +1325,7 @@ func toolLabel(tool core.Tool) string {
 func trackingLabel(confidence core.Confidence) string {
 	switch confidence {
 	case core.ConfidenceSupervised:
-		return "managed"
+		return "supervised"
 	case core.ConfidenceObserved:
 		return "observed"
 	default:
