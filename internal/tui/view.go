@@ -492,7 +492,7 @@ func (m Model) render() string {
 		lines = append(lines, m.renderDetailPanel(width, selected), "")
 	}
 
-	lines = append(lines, footerLine(width))
+	lines = append(lines, m.palette.muted.Render(footerLine(width)))
 	return strings.Join(lines, "\n")
 }
 
@@ -550,7 +550,7 @@ func (m Model) renderWorkspacePicker(width, height int) string {
 	if len(lines) >= height && height > 0 {
 		lines = lines[:height-1]
 	}
-	lines = append(lines, footer)
+	lines = append(lines, m.palette.muted.Render(footer))
 	return strings.Join(lines, "\n")
 }
 
@@ -584,7 +584,7 @@ func (m Model) renderWorkspaceEditor(width, height int) string {
 	if len(lines) >= height && height > 0 {
 		lines = lines[:height-1]
 	}
-	lines = append(lines, footer)
+	lines = append(lines, m.palette.muted.Render(footer))
 	return strings.Join(lines, "\n")
 }
 
@@ -689,7 +689,7 @@ func (m Model) renderInspection(width, height int) string {
 		remaining--
 	}
 	lines = append(lines, m.renderInspectionViewport(width, remaining)...)
-	lines = append(lines, inspectionFooterLine(width, m.inspectionRaw))
+	lines = append(lines, m.palette.muted.Render(inspectionFooterLine(width, m.inspectionRaw)))
 	return strings.Join(lines, "\n")
 }
 
@@ -1235,13 +1235,13 @@ func (m Model) renderDetailPanel(width int, session core.Session) string {
 	if len(session.Activities) > 0 {
 		lines = append(lines,
 			field("Activity", activityDetail(session)),
-			field("Model/context", modelContextDetail(session)),
+			m.modelContextLine(session, content),
 		)
 	}
 
 	panel := lipgloss.NewStyle().
 		Border(lipgloss.RoundedBorder()).
-		BorderForeground(m.palette.muted.GetForeground()).
+		BorderForeground(m.palette.focus.GetForeground()).
 		Padding(0, 1)
 	return panel.Render(strings.Join(lines, "\n"))
 }
@@ -1284,22 +1284,22 @@ func wrapDisplayWidth(value string, width int) []string {
 }
 
 func fullHeading() string {
-	return fmt.Sprintf("  %-22s %-11s %-23s %-9s %-12s %-10s %-7s %-5s %s", "APP / TRACKING", "STATUS", "ACTIVITY", "PROCESSES", "CPU", "WS MEMORY", "CTX", "AGE", "FOLDER")
+	return fmt.Sprintf("  %-13s %-10s %-11s %-20s %-9s %-12s %-10s %-7s %-5s %s", "APP", "TRACKING", "STATUS", "ACTIVITY", "PROCESSES", "CPU", "WS MEMORY", "CTX", "AGE", "FOLDER")
 }
 
 func fullRow(session core.Session, now time.Time) string {
-	return fmt.Sprintf("  %-22s %-11s %-23s %-9d %-12s %-10s %-7s %-5s %s",
-		toolLabel(session.Tool)+" / "+trackingLabel(session.Confidence), string(session.State), activitySummary(session), len(session.Processes),
+	return fmt.Sprintf("  %-13s %-10s %-11s %-20s %-9d %-12s %-10s %-7s %-5s %s",
+		toolLabel(session.Tool), trackingLabel(session.Confidence), string(session.State), activitySummary(session), len(session.Processes),
 		cpuCell(session), memoryLabel(session.Resources), sessionContextLabel(session), ageLabel(session.StartedAt, now), folder(session))
 }
 
 func mediumHeading() string {
-	return fmt.Sprintf("  %-22s %-11s %-23s %-4s %-7s", "APP / TRACKING", "STATUS", "ACTIVITY", "PROC", "CTX")
+	return fmt.Sprintf("  %-13s %-10s %-11s %-20s %-4s %-7s", "APP", "TRACKING", "STATUS", "ACTIVITY", "PROC", "CTX")
 }
 
 func mediumRow(session core.Session, now time.Time) string {
-	return fmt.Sprintf("  %-22s %-11s %-23s %-4d %-7s",
-		toolLabel(session.Tool)+" / "+trackingLabel(session.Confidence), string(session.State), activitySummary(session), len(session.Processes), sessionContextLabel(session))
+	return fmt.Sprintf("  %-13s %-10s %-11s %-20s %-4d %-7s",
+		toolLabel(session.Tool), trackingLabel(session.Confidence), string(session.State), activitySummary(session), len(session.Processes), sessionContextLabel(session))
 }
 
 func mediumDetailRow(session core.Session, now time.Time) string {
@@ -1348,9 +1348,15 @@ func activityDetail(session core.Session) string {
 	return value
 }
 
-func modelContextDetail(session core.Session) string {
+// modelContextLine renders the detail panel's "Model/context" field with the
+// context percentage colored by fill (contextStyle). Plain text stays
+// "Model/context: <model> · <pct>", identical to the old flat field, so only
+// the color changes. Falls back to a muted clipped line when it would overflow
+// the panel content width, matching the generic field() behavior.
+func (m Model) modelContextLine(session core.Session, content int) string {
+	const label = "Model/context: "
 	if len(session.Activities) == 0 {
-		return "—"
+		return m.palette.muted.Render(clip(label, content)) + m.palette.text.Render(clip("—", content-lipgloss.Width(label)))
 	}
 	activity, hasContext := highestContextActivity(session.Activities)
 	if !hasContext {
@@ -1360,7 +1366,30 @@ func modelContextDetail(session core.Session) string {
 	if model == "" {
 		model = "—"
 	}
-	return model + " · " + activityContextLabel(activity)
+	ctx := activityContextLabel(activity)
+	plain := label + model + " · " + ctx
+	if lipgloss.Width(plain) > content {
+		return m.palette.muted.Render(clip(plain, content))
+	}
+	percent := -1.0
+	if activity.ContextWindow > 0 && activity.ContextTokens >= 0 {
+		percent = float64(activity.ContextTokens) / float64(activity.ContextWindow) * 100
+	}
+	return m.palette.muted.Render(label) + m.palette.text.Render(model+" · ") + m.contextStyle(percent).Render(ctx)
+}
+
+// contextStyle reserves color for context windows that are filling up: amber
+// past 70%, red past 90%, default text otherwise. Negative means unknown, so
+// it stays in the default foreground.
+func (m Model) contextStyle(percent float64) lipgloss.Style {
+	switch {
+	case percent >= 90:
+		return m.palette.failure
+	case percent >= 70:
+		return m.palette.warning
+	default:
+		return m.palette.text
+	}
 }
 
 func highestContextActivity(activities []core.AgentActivity) (core.AgentActivity, bool) {

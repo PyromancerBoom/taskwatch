@@ -108,6 +108,22 @@ func TestMediumAndNarrowRenderingKeepRequiredFieldsAndFolder(t *testing.T) {
 	}
 }
 
+func TestSessionHeadingsDoNotCombineFields(t *testing.T) {
+	for name, heading := range map[string]string{
+		"wide":   fullHeading(),
+		"medium": mediumHeading(),
+	} {
+		if strings.Contains(heading, "/") {
+			t.Fatalf("%s heading combines fields: %q", name, heading)
+		}
+		for _, want := range []string{"APP", "TRACKING", "STATUS", "ACTIVITY"} {
+			if !strings.Contains(heading, want) {
+				t.Fatalf("%s heading missing separate %q field: %q", name, want, heading)
+			}
+		}
+	}
+}
+
 func TestRenderingNeverOverflowsWidthsAtLeastForty(t *testing.T) {
 	session := detailedSession()
 	session.Workspace = `C:\a very long workspace folder\with\many\nested\segments\that must truncate safely`
