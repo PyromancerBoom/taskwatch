@@ -887,6 +887,57 @@ func TestInspectionWideAndNarrowViewsShowContextAndProcessFields(t *testing.T) {
 	}
 }
 
+func TestInspectionCompactRowsAndRawToggleRenderDistinctViews(t *testing.T) {
+	created := time.Date(2026, 7, 15, 1, 2, 3, 0, time.UTC)
+	tree := inspectionTreeWithRows([]core.ProcessTreeRow{
+		{Process: core.Process{PID: 10, ParentPID: 1, Name: "raw-host.exe", CommandLine: "secret raw command", CreatedAt: created}},
+		{Process: core.Process{PID: 11, ParentPID: 10, Name: "raw-helper.exe", CreatedAt: created.Add(time.Second)}, Depth: 1},
+	})
+	tree.CompactRows = []core.CompactProcessRow{
+		{
+			Label: "Codex agent host", ProcessCount: 1, PID: 10, ParentPID: 1, StartedAt: created,
+			Resources: core.ResourceUsage{CPUPercent: 7.5, MemoryBytes: 1572864, CPUAvailable: true, MemoryAvailable: true},
+		},
+		{
+			Label: "+3 shell/helper processes", Depth: 1, ProcessCount: 3, StartedAt: created.Add(time.Second),
+			Resources: core.ResourceUsage{CPUPercent: 2.5, MemoryBytes: 3145728, CPUAvailable: true, MemoryAvailable: true},
+		},
+	}
+
+	for _, width := range []int{130, 60} {
+		t.Run(fmt.Sprintf("compact_width_%d", width), func(t *testing.T) {
+			model := inspectionTestModel(width, 24, tree, nil, false)
+			model.now = func() time.Time { return time.Date(2026, 7, 15, 3, 4, 5, 0, time.UTC) }
+			plain := flattenRendered(model.View().Content)
+			for _, want := range []string{"Compact Process Tree", "Codex agent host", "+3 shell/helper processes", "3 procs", "10", "1", "01:02:03", "7.5%", "1.5 MB", "2.5%", "3.0 MB", "t raw tree"} {
+				if !strings.Contains(plain, want) {
+					t.Fatalf("compact width %d missing %q:\n%s", width, want, model.View().Content)
+				}
+			}
+			for _, forbidden := range []string{"raw-host.exe", "raw-helper.exe", "secret raw command"} {
+				if strings.Contains(plain, forbidden) {
+					t.Fatalf("compact width %d exposed %q:\n%s", width, forbidden, model.View().Content)
+				}
+			}
+		})
+	}
+
+	model := inspectionTestModel(130, 24, tree, nil, false)
+	model.now = func() time.Time { return time.Date(2026, 7, 15, 3, 4, 5, 0, time.UTC) }
+	model.inspectionRaw = true
+	plain := flattenRendered(model.View().Content)
+	for _, want := range []string{"Raw Process Tree", "raw-host.exe", "raw-helper.exe", "t compact"} {
+		if !strings.Contains(plain, want) {
+			t.Fatalf("raw view missing %q:\n%s", want, model.View().Content)
+		}
+	}
+	for _, forbidden := range []string{"Codex agent host", "+3 shell/helper processes", "secret raw command"} {
+		if strings.Contains(plain, forbidden) {
+			t.Fatalf("raw view exposed compact/command-line text %q:\n%s", forbidden, model.View().Content)
+		}
+	}
+}
+
 func TestCodexDesktopInspectionIsLabeledAsApplicationTree(t *testing.T) {
 	tree := inspectionTreeWithRows(nil)
 	tree.Session.Tool = core.ToolCodexDesktop
@@ -1006,8 +1057,8 @@ func TestInspectionResizeMatrixCapsWidthHeightAndKeepsFooterLast(t *testing.T) {
 					t.Fatalf("rendered %d lines, want <= %d:\n%s", len(lines), height, content)
 				}
 				last := flattenRendered(lines[len(lines)-1])
-				if last != inspectionFooterLine(width) {
-					t.Fatalf("footer not last at %dx%d: got %q want %q\n%s", width, height, last, inspectionFooterLine(width), content)
+				if last != inspectionFooterLine(width, false) {
+					t.Fatalf("footer not last at %dx%d: got %q want %q\n%s", width, height, last, inspectionFooterLine(width, false), content)
 				}
 			})
 		}
@@ -1017,7 +1068,7 @@ func TestInspectionResizeMatrixCapsWidthHeightAndKeepsFooterLast(t *testing.T) {
 func TestInspectionFooterAdvertisesOnlyReadOnlyInspectionKeys(t *testing.T) {
 	content := inspectionTestModel(130, 20, inspectionTreeWithRows(nil), nil, false).View().Content
 	plain := flattenRendered(content)
-	for _, want := range []string{"No termination keys", "↑/↓", "PgUp/PgDn", "r refresh", "Enter/Esc back", "Ctrl+C"} {
+	for _, want := range []string{"No termination keys", "↑/↓", "PgUp/PgDn", "t raw tree", "r refresh", "Enter/Esc back", "Ctrl+C"} {
 		if !strings.Contains(plain, want) {
 			t.Fatalf("inspection footer missing %q:\n%s", want, content)
 		}

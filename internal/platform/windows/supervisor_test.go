@@ -1002,6 +1002,9 @@ func TestProcessSnapshotterStoresResourceAvailabilityOnProcess(t *testing.T) {
 	snapshotter := NewProcessSnapshotter()
 	entry := winapi.ProcessEntry32{ProcessID: uint32(os.Getpid())}
 	first := snapshotter.detailsForEntry(entry, time.Unix(100, 0).UTC())
+	if first.Process.CommandLine == "" {
+		t.Fatal("current process command line was not stored on core.Process")
+	}
 	if first.Process.CPUAvailable {
 		t.Fatal("first CPU sample is available, want unavailable")
 	}

@@ -31,12 +31,6 @@ var footerHints = []string{
 	"Enter c/x r ↑↓ ^C",
 }
 
-var inspectionFooterHints = []string{
-	"No termination keys • ↑/↓ scroll • PgUp/PgDn page • r refresh • Enter/Esc back • Ctrl+C close",
-	"↑/↓ scroll • PgUp/PgDn • r refresh • Enter/Esc back • ^C close",
-	"↑↓ • r • Enter/Esc • ^C",
-}
-
 var workspacePickerFooterHints = []string{
 	"↑/↓ move  •  PgUp/PgDn page  •  Enter launch here  •  Esc back  •  Ctrl+C close",
 	"↑/↓ • PgUp/PgDn • Enter launch • Esc back • ^C close",
@@ -67,13 +61,22 @@ func footerLine(width int) string {
 	return clip(footerHints[len(footerHints)-1], width)
 }
 
-func inspectionFooterLine(width int) string {
-	for _, hint := range inspectionFooterHints {
+func inspectionFooterLine(width int, raw bool) string {
+	toggle := "t raw tree"
+	if raw {
+		toggle = "t compact"
+	}
+	hints := []string{
+		"No termination keys • ↑/↓ scroll • PgUp/PgDn page • " + toggle + " • r refresh • Enter/Esc back • Ctrl+C close",
+		"↑/↓ • PgUp/PgDn • " + toggle + " • r • Enter/Esc • ^C",
+		"↑↓ • " + toggle + " • r • Enter/Esc • ^C",
+	}
+	for _, hint := range hints {
 		if lipgloss.Width(hint) <= width {
 			return hint
 		}
 	}
-	return clip(inspectionFooterHints[len(inspectionFooterHints)-1], width)
+	return clip(hints[len(hints)-1], width)
 }
 
 func workspacePickerFooterLine(width int) string {
@@ -685,7 +688,7 @@ func (m Model) renderInspection(width, height int) string {
 		remaining--
 	}
 	lines = append(lines, m.renderInspectionViewport(width, remaining)...)
-	lines = append(lines, inspectionFooterLine(width))
+	lines = append(lines, inspectionFooterLine(width, m.inspectionRaw))
 	return strings.Join(lines, "\n")
 }
 
@@ -703,7 +706,10 @@ func (m Model) inspectionSession() core.Session {
 
 func (m Model) inspectionContextLines(width int) []string {
 	session := m.inspectionSession()
-	title := "Process Tree"
+	title := "Compact Process Tree"
+	if m.inspectionRaw {
+		title = "Raw Process Tree"
+	}
 	inspectionTool := toolLabel(session.Tool)
 	if session.Tool == core.ToolCodexDesktop {
 		inspectionTool += " application tree"
@@ -736,10 +742,11 @@ func (m Model) renderInspectionViewport(width, viewportLines int) []string {
 	if viewportLines <= 0 {
 		return nil
 	}
-	rows := m.inspectionTree.Rows
+	total := m.inspectionRowCount()
+	compact := !m.inspectionRaw && m.inspectionTree.CompactRows != nil
 	var body []string
 
-	if m.inspectionPending && len(rows) == 0 {
+	if m.inspectionPending && total == 0 {
 		return []string{m.palette.focus.Render(clip("Loading process tree…", width))}
 	}
 	if m.inspectionErr != nil {
@@ -750,31 +757,88 @@ func (m Model) renderInspectionViewport(width, viewportLines int) []string {
 			style = m.palette.warning
 		}
 		body = append(body, style.Render(clip(message, width)))
-		if errors.Is(m.inspectionErr, app.ErrSessionNotFound) || len(rows) == 0 || len(body) >= viewportLines {
+		if errors.Is(m.inspectionErr, app.ErrSessionNotFound) || total == 0 || len(body) >= viewportLines {
 			return body[:min(len(body), viewportLines)]
 		}
 	}
-	if len(rows) == 0 {
+	if total == 0 {
 		body = append(body, m.palette.muted.Render(clip("No processes remain for this session.", width)))
 		return body[:min(len(body), viewportLines)]
 	}
 
 	rowBudget := m.effectiveInspectionRowViewportLineCount(viewportLines)
 	rowsPerProcess := inspectionRowsPerProcess(width)
-	start, end, showAbove, showBelow := sessionWindow(len(rows), m.inspectionScrollOffset, rowBudget, rowsPerProcess)
+	start, end, showAbove, showBelow := sessionWindow(total, m.inspectionScrollOffset, rowBudget, rowsPerProcess)
 	if showAbove {
 		body = append(body, m.palette.muted.Render(clip(fmt.Sprintf("↑ %d more", start), width)))
 	}
-	for _, row := range rows[start:end] {
-		body = append(body, m.renderInspectionProcess(row, width)...)
+	if compact {
+		for _, row := range m.inspectionTree.CompactRows[start:end] {
+			body = append(body, m.renderCompactInspectionProcess(row, width)...)
+		}
+	} else {
+		for _, row := range m.inspectionTree.Rows[start:end] {
+			body = append(body, m.renderInspectionProcess(row, width)...)
+		}
 	}
 	if showBelow {
-		body = append(body, m.palette.muted.Render(clip(fmt.Sprintf("↓ %d more", len(rows)-end), width)))
+		body = append(body, m.palette.muted.Render(clip(fmt.Sprintf("↓ %d more", total-end), width)))
 	}
 	if len(body) > viewportLines {
 		body = body[:viewportLines]
 	}
 	return body
+}
+
+func (m Model) renderCompactInspectionProcess(row core.CompactProcessRow, width int) []string {
+	name := row.Label
+	if name == "" {
+		name = "<unnamed>"
+	}
+
+	pid := fmt.Sprintf("%d", row.PID)
+	parent := fmt.Sprintf("%d", row.ParentPID)
+	identity := fmt.Sprintf("PID %d · PPID %d", row.PID, row.ParentPID)
+	if row.ProcessCount > 1 {
+		pid = fmt.Sprintf("%d procs", row.ProcessCount)
+		parent = "—"
+		identity = pid
+	}
+	started := "Start " + m.processStartedAtLabel(row.StartedAt)
+	resources := fmt.Sprintf("CPU %s · Mem %s", resourceCPULabel(row.Resources), memoryLabel(row.Resources))
+
+	if width >= 110 {
+		const nameWidth = 40
+		structure := inspectionStructure(row.Depth, nameWidth)
+		nameCell := padDisplayWidth(name, nameWidth-lipgloss.Width(structure))
+		metadata := fmt.Sprintf(" %-8s %-8s %-8s %-10s %-10s",
+			pid, parent, m.processStartedAtLabel(row.StartedAt), resourceCPULabel(row.Resources), memoryLabel(row.Resources))
+		return []string{m.palette.focus.Render(structure) + m.palette.text.Render(nameCell) + m.palette.muted.Render(metadata)}
+	}
+
+	structure := inspectionStructure(row.Depth, width)
+	nameLine := func(suffix string) string {
+		nameWidth := width - lipgloss.Width(structure) - lipgloss.Width(suffix)
+		return m.palette.focus.Render(structure) + m.palette.text.Render(clip(name, nameWidth)) + m.palette.muted.Render(suffix)
+	}
+	suffix := "  " + pid
+	switch inspectionRowsPerProcess(width) {
+	case 2:
+		metadata := started + " · " + resources
+		if row.ProcessCount == 1 {
+			metadata = fmt.Sprintf("PPID %d · %s · %s", row.ParentPID, started, resources)
+		}
+		return []string{nameLine(suffix), m.palette.muted.Render(clip(metadata, width))}
+	case 3:
+		return []string{nameLine(""), m.palette.muted.Render(clip(identity, width)), m.palette.muted.Render(clip(started+" · "+resources, width))}
+	default:
+		return []string{
+			nameLine(""),
+			m.palette.muted.Render(clip(identity, width)),
+			m.palette.muted.Render(clip(started, width)),
+			m.palette.muted.Render(clip(resources, width)),
+		}
+	}
 }
 
 func (m Model) renderInspectionProcess(row core.ProcessTreeRow, width int) []string {
@@ -851,17 +915,25 @@ func padDisplayWidth(value string, width int) string {
 }
 
 func (m Model) processStartLabel(process core.Process) string {
-	if process.CreatedAt.IsZero() {
+	return m.processStartedAtLabel(process.CreatedAt)
+}
+
+func (m Model) processStartedAtLabel(startedAt time.Time) string {
+	if startedAt.IsZero() {
 		return "—"
 	}
-	return process.CreatedAt.In(m.now().Location()).Format("15:04:05")
+	return startedAt.In(m.now().Location()).Format("15:04:05")
 }
 
 func processCPULabel(process core.Process) string {
-	if !process.CPUAvailable {
+	return resourceCPULabel(core.ResourceUsage{CPUPercent: process.CPUPercent, CPUAvailable: process.CPUAvailable})
+}
+
+func resourceCPULabel(resources core.ResourceUsage) string {
+	if !resources.CPUAvailable {
 		return "—"
 	}
-	return fmt.Sprintf("%.1f%%", process.CPUPercent)
+	return fmt.Sprintf("%.1f%%", resources.CPUPercent)
 }
 
 func processMemoryLabel(process core.Process) string {

@@ -9,7 +9,6 @@ import "github.com/PyromancerBoom/taskwatch/internal/core"
 type ProcessDetails struct {
 	Process            core.Process
 	ExecutablePath     string
-	CommandLine        string
 	MetadataAccessible bool
 	MetadataError      string
 }

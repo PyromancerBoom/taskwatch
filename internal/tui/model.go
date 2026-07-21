@@ -95,6 +95,7 @@ type Model struct {
 	inspectionLoadRequestID uint64
 	inspectionScrollOffset  int
 	inspectionRequestID     uint64
+	inspectionRaw           bool
 
 	workspaceChoices     []workspaceChoice
 	workspacePickerIndex int
@@ -301,6 +302,12 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		if m.screen == screenInspection {
 			switch msg.String() {
+			case "t":
+				if m.inspectionPending {
+					return m, nil
+				}
+				m.inspectionRaw = !m.inspectionRaw
+				m.inspectionScrollOffset = 0
 			case "enter":
 				if m.inspectionPending {
 					return m, nil
@@ -345,6 +352,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.inspectionPending = true
 			m.inspectionLoadInFlight = true
 			m.inspectionScrollOffset = 0
+			m.inspectionRaw = false
 			m.inspectionRequestID++
 			m.inspectionLoadRequestID++
 			sessionID := m.inspectionSessionID
@@ -588,6 +596,7 @@ func (m *Model) leaveInspection() {
 	m.inspectionErr = nil
 	m.inspectionPending = false
 	m.inspectionScrollOffset = 0
+	m.inspectionRaw = false
 }
 
 func (m *Model) applyInspectionResult(tree app.ProcessTree, err error, refreshing bool) {
@@ -598,6 +607,7 @@ func (m *Model) applyInspectionResult(tree app.ProcessTree, err error, refreshin
 		m.inspectionTree = tree
 	case errors.Is(err, app.ErrSessionNotFound):
 		m.inspectionTree.Rows = nil
+		m.inspectionTree.CompactRows = nil
 	case !refreshing:
 		m.inspectionTree = tree
 	}
@@ -606,7 +616,7 @@ func (m *Model) applyInspectionResult(tree app.ProcessTree, err error, refreshin
 
 func (m Model) inspectionPageSize() int {
 	start, end, _, _ := sessionWindow(
-		len(m.inspectionTree.Rows), m.inspectionScrollOffset,
+		m.inspectionRowCount(), m.inspectionScrollOffset,
 		m.inspectionRowViewportLineCount(), inspectionRowsPerProcess(m.width),
 	)
 	if size := end - start; size > 0 {
@@ -621,7 +631,7 @@ func (m *Model) moveInspectionScroll(delta int) {
 }
 
 func (m *Model) clampInspectionScrollOffset() {
-	total := len(m.inspectionTree.Rows)
+	total := m.inspectionRowCount()
 	if total == 0 {
 		m.inspectionScrollOffset = 0
 		return
@@ -641,6 +651,13 @@ func (m *Model) clampInspectionScrollOffset() {
 	if m.inspectionScrollOffset > maxOffset {
 		m.inspectionScrollOffset = maxOffset
 	}
+}
+
+func (m Model) inspectionRowCount() int {
+	if !m.inspectionRaw && m.inspectionTree.CompactRows != nil {
+		return len(m.inspectionTree.CompactRows)
+	}
+	return len(m.inspectionTree.Rows)
 }
 
 func inspectionRowsPerProcess(width int) int {

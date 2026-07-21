@@ -40,7 +40,8 @@ In the terminal UI:
 
 - Press `c` to launch Claude Code, or `x` to launch Codex CLI.
 - Choose a workspace (or enter one) for that new session.
-- Press `Enter` to inspect the selected process tree.
+- Press `Enter` to inspect the selected session in a compact, friendly process tree.
+- Press `t` during inspection to toggle the exact raw process tree.
 - Press `r` to refresh immediately.
 - Press `Ctrl+C` to close TaskWatch. It leaves all processes running.
 

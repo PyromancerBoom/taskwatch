@@ -1128,6 +1128,9 @@ func TestInspectReturnsCachedProcessTreeWithoutCallingDependencies(t *testing.T)
 	if len(got.Rows) != 3 || got.Rows[0].Process.PID != 10 || got.Rows[0].Depth != 0 || got.Rows[1].Process.PID != 11 || got.Rows[1].Depth != 1 || got.Rows[2].Process.PID != 12 || got.Rows[2].Depth != 2 {
 		t.Fatalf("Inspect() rows = %#v, want deterministic preorder", got.Rows)
 	}
+	if len(got.CompactRows) != 3 || got.CompactRows[0].PID != 10 || got.CompactRows[0].Depth != 0 || got.CompactRows[1].PID != 11 || got.CompactRows[1].Depth != 1 || got.CompactRows[2].PID != 12 || got.CompactRows[2].Depth != 2 {
+		t.Fatalf("Inspect() compact rows = %#v, want compact projection of cached forest", got.CompactRows)
+	}
 	if store.loadCalls != 0 || store.saveCalls != 0 || len(supervisor.recoverCalls) != 0 || len(supervisor.refreshCalls) != 0 || supervisor.closeCalls != 0 || len(observer.calls) != 0 {
 		t.Fatalf("dependency calls after Inspect() = load %d, save %d, recover %d, refresh %d, close %d, observe %d; want all zero", store.loadCalls, store.saveCalls, len(supervisor.recoverCalls), len(supervisor.refreshCalls), supervisor.closeCalls, len(observer.calls))
 	}
@@ -1135,13 +1138,15 @@ func TestInspectReturnsCachedProcessTreeWithoutCallingDependencies(t *testing.T)
 	got.Session.ID = "mutated"
 	got.Session.Processes[0].Name = "mutated"
 	got.Rows[0].Process.Name = "mutated"
+	got.CompactRows[0].Label = "mutated"
 	got.Rows = nil
+	got.CompactRows = nil
 
 	again, err := coordinator.Inspect("managed")
 	if err != nil {
 		t.Fatalf("second Inspect() error = %v", err)
 	}
-	if again.Session.ID != "managed" || again.Session.Processes[0].Name == "mutated" || len(again.Rows) != 3 || again.Rows[0].Process.Name == "mutated" {
+	if again.Session.ID != "managed" || again.Session.Processes[0].Name == "mutated" || len(again.Rows) != 3 || again.Rows[0].Process.Name == "mutated" || len(again.CompactRows) != 3 || again.CompactRows[0].Label == "mutated" {
 		t.Fatalf("Inspect() caller mutation leaked into coordinator state: %#v", again)
 	}
 	observedTree, err := coordinator.Inspect("observed")

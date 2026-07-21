@@ -64,8 +64,9 @@ type LaunchResult struct {
 }
 
 type ProcessTree struct {
-	Session core.Session
-	Rows    []core.ProcessTreeRow
+	Session     core.Session
+	Rows        []core.ProcessTreeRow
+	CompactRows []core.CompactProcessRow
 }
 
 type Coordinator struct {
@@ -369,9 +370,11 @@ func (coordinator *Coordinator) Inspect(sessionID string) (ProcessTree, error) {
 	}
 
 	session := cloneSession(*found)
+	rows := core.CollectProcessForest(session.Processes)
 	return ProcessTree{
-		Session: session,
-		Rows:    core.CollectProcessForest(session.Processes),
+		Session:     session,
+		Rows:        rows,
+		CompactRows: core.BuildCompactProcessForest(session, rows),
 	}, nil
 }
 

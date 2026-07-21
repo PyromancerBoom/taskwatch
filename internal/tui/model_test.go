@@ -1333,6 +1333,51 @@ func TestEnterAndEscapeReturnFromCompletedInspectionWithoutCoordinatorMutation(t
 	}
 }
 
+func TestInspectionToggleSwitchesRawAndCompactRowsAndResetsScroll(t *testing.T) {
+	raw := make([]core.ProcessTreeRow, 8)
+	for i := range raw {
+		raw[i].Process = core.Process{PID: uint32(i + 1)}
+	}
+	compact := []core.CompactProcessRow{{Label: "agent", ProcessCount: 1}, {Label: "helpers", ProcessCount: 7}}
+	model := NewModel(&stubCoordinator{}, time.Second)
+	model.started = true
+	model.screen = screenInspection
+	model.inspectionTree = app.ProcessTree{Rows: raw, CompactRows: compact}
+	model.inspectionScrollOffset = 1
+
+	model, cmd := update(t, model, key("t"))
+	if cmd != nil || !model.inspectionRaw || model.inspectionScrollOffset != 0 || model.inspectionRowCount() != len(raw) {
+		t.Fatalf("raw toggle: cmd=%v raw=%v offset=%d rows=%d", cmd, model.inspectionRaw, model.inspectionScrollOffset, model.inspectionRowCount())
+	}
+	model.inspectionScrollOffset = 5
+	model, cmd = update(t, model, key("t"))
+	if cmd != nil || model.inspectionRaw || model.inspectionScrollOffset != 0 || model.inspectionRowCount() != len(compact) {
+		t.Fatalf("compact toggle: cmd=%v raw=%v offset=%d rows=%d", cmd, model.inspectionRaw, model.inspectionScrollOffset, model.inspectionRowCount())
+	}
+}
+
+func TestInspectionToggleIsBlockedWhileLoadingAndNewInspectionResetsCompactMode(t *testing.T) {
+	model := NewModel(&stubCoordinator{}, time.Second)
+	model.started = true
+	model.screen = screenInspection
+	model.inspectionPending = true
+	model.inspectionRaw = true
+
+	model, cmd := update(t, model, key("t"))
+	if cmd != nil || !model.inspectionRaw {
+		t.Fatalf("pending toggle changed mode: cmd=%v raw=%v", cmd, model.inspectionRaw)
+	}
+
+	model.inspectionPending = false
+	model.screen = screenDashboard
+	model.snapshot.Sessions = []core.Session{session("one")}
+	model.selectedID = "one"
+	model, cmd = update(t, model, key("enter"))
+	if cmd == nil || model.inspectionRaw {
+		t.Fatalf("new inspection: cmd nil=%v raw=%v, want compact", cmd == nil, model.inspectionRaw)
+	}
+}
+
 func TestInspectionRefreshesSnapshotThenSameSessionTreeAtomically(t *testing.T) {
 	for _, trigger := range []string{"automatic", "manual"} {
 		t.Run(trigger, func(t *testing.T) {
@@ -1353,6 +1398,7 @@ func TestInspectionRefreshesSnapshotThenSameSessionTreeAtomically(t *testing.T) 
 			model.screen = screenInspection
 			model.inspectionSessionID = "one"
 			model.inspectionTree = oldTree
+			model.inspectionRaw = true
 			scheduled, _ := model.scheduleTick()
 			model = scheduled.(Model)
 
@@ -1378,7 +1424,7 @@ func TestInspectionRefreshesSnapshotThenSameSessionTreeAtomically(t *testing.T) 
 				t.Fatalf("coordinator order = %v, want refresh then inspect:one", coordinator.events)
 			}
 			model, nextTick := update(t, model, result)
-			if model.refreshing || model.snapshot.CurrentDir != "fresh" || model.inspectionTree.Rows[0].Process.PID != 2 || nextTick == nil {
+			if model.refreshing || model.snapshot.CurrentDir != "fresh" || model.inspectionTree.Rows[0].Process.PID != 2 || !model.inspectionRaw || nextTick == nil {
 				t.Fatalf("combined result: refreshing=%v workspace=%q tree=%#v next tick nil=%v", model.refreshing, model.snapshot.CurrentDir, model.inspectionTree, nextTick == nil)
 			}
 		})
@@ -1396,7 +1442,11 @@ func TestInspectionRefreshKeepsScreenWhenSessionDisappears(t *testing.T) {
 	model.selectedID = "one"
 	model.screen = screenInspection
 	model.inspectionSessionID = "one"
-	model.inspectionTree = app.ProcessTree{Session: session("one"), Rows: []core.ProcessTreeRow{{Process: core.Process{PID: 1}}}}
+	model.inspectionTree = app.ProcessTree{
+		Session:     session("one"),
+		Rows:        []core.ProcessTreeRow{{Process: core.Process{PID: 1}}},
+		CompactRows: []core.CompactProcessRow{{Label: "old", ProcessCount: 1}},
+	}
 	model.tick = fakeTick(new([]tickCall))
 
 	model, cmd := update(t, model, key("r"))
@@ -1405,7 +1455,7 @@ func TestInspectionRefreshKeepsScreenWhenSessionDisappears(t *testing.T) {
 	}
 	model, _ = update(t, model, cmd())
 
-	if model.screen != screenInspection || !errors.Is(model.inspectionErr, app.ErrSessionNotFound) || len(model.inspectionTree.Rows) != 0 {
+	if model.screen != screenInspection || !errors.Is(model.inspectionErr, app.ErrSessionNotFound) || len(model.inspectionTree.Rows) != 0 || len(model.inspectionTree.CompactRows) != 0 {
 		t.Fatalf("disappearance: screen=%v err=%v tree=%#v", model.screen, model.inspectionErr, model.inspectionTree)
 	}
 }

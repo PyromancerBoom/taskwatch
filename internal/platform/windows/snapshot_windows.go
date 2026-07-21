@@ -111,7 +111,7 @@ func (snapshotter *ProcessSnapshotter) detailsForEntry(entry winapi.ProcessEntry
 		detail.MetadataError = appendMetadataError(detail.MetadataError, "path", err)
 	}
 	if commandLine, err := queryCommandLine(process); err == nil {
-		detail.CommandLine = commandLine
+		detail.Process.CommandLine = commandLine
 	} else {
 		detail.MetadataError = appendMetadataError(detail.MetadataError, "command line", err)
 	}

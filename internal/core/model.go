@@ -41,6 +41,7 @@ type Process struct {
 	PID             uint32
 	ParentPID       uint32
 	Name            string
+	CommandLine     string
 	CreatedAt       time.Time
 	CPUPercent      float64
 	MemoryBytes     uint64
