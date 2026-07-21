@@ -1,9 +1,7 @@
 # AGENTS.md
 
-TaskWatch is a Windows tool for finding and safely cleaning up processes left
-behind by Claude Code, Codex CLI, and the Codex desktop app. Written in Go with
-a Bubble Tea terminal UI. See [docs/system-design.md](docs/system-design.md)
-for the full architecture.
+TaskWatch is a process manager for AI coding agents. 
+Supports Windows for now, with possible extensions in the future.
 
 ## Commands
 
@@ -37,9 +35,11 @@ Run a single package's tests: `./scripts/go-local.ps1 test ./internal/core`.
 TaskWatch treats "kill this process" as a decision only the user makes. When
 touching supervision, observation, or termination code, preserve these:
 
-1. TaskWatch never terminates a process on its own; every termination is
-   explicitly user-confirmed and locked to one session and one exact process
-   set.
+1. TaskWatch never automatically terminates an existing or successfully
+   launched process. It may roll back only its own newly created suspended
+   process when launch setup fails before resume. Every future cleanup action
+   is explicitly user-confirmed and locked to one session and one exact
+   process set.
 2. Process identity is always PID **plus** creation time — never a bare PID.
 3. Missing or unreadable metadata lowers confidence and blocks unsafe actions;
    it is never treated as a green light.
@@ -48,7 +48,7 @@ touching supervision, observation, or termination code, preserve these:
    are ever terminated. Never call `TerminateJobObject`.
 5. Closing TaskWatch does not terminate a Job Object (no kill-on-close).
 
-The full rule set lives in `docs/system-design.md` → "Safety rules".
+These rules are binding and must stay aligned with the platform tests.
 
 ## Conventions
 

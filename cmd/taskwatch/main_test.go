@@ -41,9 +41,10 @@ The selected CLI must be available on PATH.`
 		"TaskWatch v0.1.0-preview",
 		"Windows technical preview",
 		"Codex Desktop as one application process tree",
-		"Restart recovery requires the launched CLI root process to still be running",
+		"Restart recovery remains available while the supervised session has running processes",
 		"Session termination controls are unavailable in v0.1",
 		`%LocalAppData%\TaskWatch\sessions.json`,
+		`%LocalAppData%\TaskWatch\workspaces.json`,
 		"taskwatch --version",
 	} {
 		if !strings.Contains(stdout.String(), want) {

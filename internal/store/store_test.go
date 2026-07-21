@@ -7,7 +7,7 @@ import (
 	"testing"
 	"time"
 
-	"taskwatch/internal/core"
+	"github.com/PyromancerBoom/taskwatch/internal/core"
 )
 
 func TestSaveAndLoadRoundTripSupervisedSessionsOnly(t *testing.T) {

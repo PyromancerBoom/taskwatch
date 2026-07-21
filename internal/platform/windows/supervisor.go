@@ -11,7 +11,7 @@ import (
 	"syscall"
 	"time"
 
-	"taskwatch/internal/core"
+	"github.com/PyromancerBoom/taskwatch/internal/core"
 )
 
 type nativeHandle uintptr

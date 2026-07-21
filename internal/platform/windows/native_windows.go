@@ -14,7 +14,7 @@ import (
 
 	winapi "golang.org/x/sys/windows"
 
-	"taskwatch/internal/core"
+	"github.com/PyromancerBoom/taskwatch/internal/core"
 )
 
 const (

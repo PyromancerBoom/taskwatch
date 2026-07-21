@@ -9,8 +9,8 @@ import (
 
 	"charm.land/lipgloss/v2"
 
-	"taskwatch/internal/app"
-	"taskwatch/internal/core"
+	"github.com/PyromancerBoom/taskwatch/internal/app"
+	"github.com/PyromancerBoom/taskwatch/internal/core"
 )
 
 var viewNow = time.Date(2026, 7, 15, 3, 4, 5, 0, time.Local)
@@ -52,7 +52,7 @@ func detailedSession() core.Session {
 func TestFullRenderingShowsHeaderEveryColumnAndFooter(t *testing.T) {
 	content := testModel(130, []core.Session{detailedSession()}).View().Content
 	for _, want := range []string{
-		"TASKWATCH", "READ-ONLY PREVIEW", "● LIVE · 03:04:05",
+		"TASKWATCH", "TECHNICAL PREVIEW", "● LIVE · 03:04:05",
 		"APP", "TRACKING", "STATUS", "PROCESSES", "CPU", "MEMORY", "AGE", "FOLDER",
 		"Codex CLI", "supervised", "running", "2", "12.3%", "1.5 MB", "2h", `C:\repo`,
 		"No termination keys", "Enter inspect", "c/x launch", "r refresh", "↑/↓ move", "Ctrl+C close",
@@ -182,8 +182,8 @@ func TestPreviewHeaderAppearsOnEveryNormalScreenAcrossWidths(t *testing.T) {
 				model.inspectionTree = app.ProcessTree{Session: detailedSession()}
 
 				content := model.View().Content
-				if !strings.Contains(flattenRendered(content), "READ-ONLY PREVIEW") {
-					t.Fatalf("normal screen missing read-only preview header at width %d:\n%s", width, content)
+				if !strings.Contains(flattenRendered(content), "TECHNICAL PREVIEW") {
+					t.Fatalf("normal screen missing technical preview header at width %d:\n%s", width, content)
 				}
 				assertWithinWidth(t, content, width)
 				if got := len(strings.Split(content, "\n")); got > model.height {
@@ -194,7 +194,7 @@ func TestPreviewHeaderAppearsOnEveryNormalScreenAcrossWidths(t *testing.T) {
 	}
 }
 
-func TestReadOnlyPreviewSurvivesStartupAndTightFallbacks(t *testing.T) {
+func TestTechnicalPreviewSurvivesStartupAndTightFallbacks(t *testing.T) {
 	tests := map[string]Model{
 		"tiny normal screen": func() Model {
 			model := testModel(minimumTerminalWidth, []core.Session{detailedSession()})
@@ -217,8 +217,8 @@ func TestReadOnlyPreviewSurvivesStartupAndTightFallbacks(t *testing.T) {
 	for name, model := range tests {
 		t.Run(name, func(t *testing.T) {
 			content := model.View().Content
-			if !strings.Contains(flattenRendered(content), "READ-ONLY PREVIEW") {
-				t.Fatalf("screen missing read-only preview marker:\n%s", content)
+			if !strings.Contains(flattenRendered(content), "TECHNICAL PREVIEW") {
+				t.Fatalf("screen missing technical preview marker:\n%s", content)
 			}
 			assertWithinWidth(t, content, model.width)
 			height := model.height

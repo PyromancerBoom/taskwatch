@@ -9,14 +9,14 @@ import (
 	tea "charm.land/bubbletea/v2"
 	"charm.land/lipgloss/v2"
 
-	"taskwatch/internal/app"
-	"taskwatch/internal/core"
+	"github.com/PyromancerBoom/taskwatch/internal/app"
+	"github.com/PyromancerBoom/taskwatch/internal/core"
 )
 
 // brand is the application wordmark shown in the header. It stays contiguous
 // with the workspace and status that follow it so the header reads as one line.
 const brand = "TASKWATCH"
-const previewLabel = "READ-ONLY PREVIEW"
+const previewLabel = "TECHNICAL PREVIEW"
 
 const minimumTerminalWidth = 25
 
@@ -168,7 +168,7 @@ func (m Model) statusChipStyle() lipgloss.Style {
 // segment) and the model's viewport bookkeeping (which only needs the line
 // count), so both agree on how many lines the header actually costs.
 //
-// The header carries the brand chip, read-only preview marker, and status: there is no global
+// The header carries the brand chip, technical-preview marker, and status: there is no global
 // "active workspace" anymore — a workspace is chosen per launch — so nothing
 // in the header implies a mutable launch target. All three share one line
 // when they fit, with compact wrapped variants at narrower widths.

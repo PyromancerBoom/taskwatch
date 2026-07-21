@@ -11,7 +11,7 @@ import (
 	"testing"
 	"time"
 
-	"taskwatch/internal/core"
+	"github.com/PyromancerBoom/taskwatch/internal/core"
 )
 
 var (

@@ -2,7 +2,7 @@
 // observation boundary for TaskWatch.
 package windows
 
-import "taskwatch/internal/core"
+import "github.com/PyromancerBoom/taskwatch/internal/core"
 
 // ProcessDetails augments the portable process model with metadata whose
 // availability depends on the target process's access controls.

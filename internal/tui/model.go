@@ -9,8 +9,8 @@ import (
 
 	tea "charm.land/bubbletea/v2"
 
-	"taskwatch/internal/app"
-	"taskwatch/internal/core"
+	"github.com/PyromancerBoom/taskwatch/internal/app"
+	"github.com/PyromancerBoom/taskwatch/internal/core"
 )
 
 const DefaultRefreshInterval = 2 * time.Second

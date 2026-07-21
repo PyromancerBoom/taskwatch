@@ -1,4 +1,4 @@
-module taskwatch
+module github.com/PyromancerBoom/taskwatch
 
 go 1.25.0
 

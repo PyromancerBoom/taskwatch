@@ -8,14 +8,14 @@ import (
 
 	tea "charm.land/bubbletea/v2"
 
-	"taskwatch/internal/app"
-	"taskwatch/internal/platform/windows"
-	"taskwatch/internal/tui"
+	"github.com/PyromancerBoom/taskwatch/internal/app"
+	"github.com/PyromancerBoom/taskwatch/internal/platform/windows"
+	"github.com/PyromancerBoom/taskwatch/internal/tui"
 )
 
 const version = "0.1.0-preview"
 
-const helpText = `TaskWatch v0.1.0-preview — Windows technical preview
+var helpText = "TaskWatch v" + version + ` — Windows technical preview
 
 Inspect packaged Codex Desktop as one application process tree.
 
@@ -28,7 +28,7 @@ Only sessions launched this way are supervised.
 Already-running CLI sessions are not discovered.
 The selected CLI must be available on PATH.
 
-Restart recovery requires the launched CLI root process to still be running.
+Restart recovery remains available while the supervised session has running processes.
 Session termination controls are unavailable in v0.1.
 
 Usage:
@@ -36,7 +36,9 @@ Usage:
   taskwatch --help
   taskwatch --version
 
-State: %LocalAppData%\TaskWatch\sessions.json
+State:
+  %LocalAppData%\TaskWatch\sessions.json
+  %LocalAppData%\TaskWatch\workspaces.json
 `
 
 type startupPaths struct {

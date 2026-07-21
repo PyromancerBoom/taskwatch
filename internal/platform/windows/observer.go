@@ -6,7 +6,7 @@ import (
 	"sort"
 	"strings"
 
-	"taskwatch/internal/core"
+	"github.com/PyromancerBoom/taskwatch/internal/core"
 )
 
 // Observer detects Codex desktop trees from process snapshots.

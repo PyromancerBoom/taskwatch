@@ -4,8 +4,8 @@ import (
 	"fmt"
 	"path/filepath"
 
-	"taskwatch/internal/core"
-	"taskwatch/internal/store"
+	"github.com/PyromancerBoom/taskwatch/internal/core"
+	"github.com/PyromancerBoom/taskwatch/internal/store"
 )
 
 type FileStore struct {

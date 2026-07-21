@@ -9,7 +9,7 @@ import (
 	"path/filepath"
 	"time"
 
-	"taskwatch/internal/core"
+	"github.com/PyromancerBoom/taskwatch/internal/core"
 )
 
 const SchemaVersion = 1

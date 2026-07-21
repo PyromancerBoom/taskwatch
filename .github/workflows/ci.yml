@@ -1,0 +1,86 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  verify:
+    runs-on: windows-2025
+    timeout-minutes: 20
+
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
+        with:
+          go-version-file: go.mod
+          cache: false
+
+      - name: Format
+        shell: pwsh
+        run: |
+          & ./scripts/go-local.ps1 fmt ./...
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          git diff --exit-code
+          if ($LASTEXITCODE -ne 0) {
+            Write-Error 'Formatting produced uncommitted changes.'
+            exit $LASTEXITCODE
+          }
+
+      - name: Verify modules
+        shell: pwsh
+        run: |
+          & ./scripts/go-local.ps1 mod verify
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Test
+        shell: pwsh
+        run: |
+          & ./scripts/go-local.ps1 test ./...
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Vet
+        shell: pwsh
+        run: |
+          & ./scripts/go-local.ps1 vet ./...
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Build
+        shell: pwsh
+        run: |
+          & ./scripts/go-local.ps1 build ./...
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Smoke test binary
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force bin | Out-Null
+          & ./scripts/go-local.ps1 -GoArgs @('build', '-o', 'bin/taskwatch.exe', './cmd/taskwatch')
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          & ./bin/taskwatch.exe --help
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $version = & ./bin/taskwatch.exe --version
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          if (($version -join "`n") -cne 'TaskWatch v0.1.0-preview') {
+            Write-Error "Unexpected version output: $($version -join "`n")"
+            exit 1
+          }
+
+      - name: Check vulnerabilities
+        shell: pwsh
+        run: |
+          & ./scripts/go-local.ps1 run golang.org/x/vuln/cmd/govulncheck@v1.6.0 ./...
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }

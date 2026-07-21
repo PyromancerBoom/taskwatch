@@ -24,6 +24,7 @@ go.work.sum
 .env.*
 !.env.example
 *.log
+/.claude/settings.local.json
 /.superpowers/
 
 # Editors and operating systems
