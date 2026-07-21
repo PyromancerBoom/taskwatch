@@ -30,6 +30,46 @@ const (
 	StateStale        State = "stale"
 )
 
+// ActivityState is semantic Codex activity derived from an ephemeral rollout.
+type ActivityState string
+
+const (
+	ActivityUnknown   ActivityState = "unknown"
+	ActivityThinking  ActivityState = "thinking"
+	ActivityExecuting ActivityState = "executing"
+	ActivityWaiting   ActivityState = "waiting"
+)
+
+// ActivityCorrelation describes how activity was associated with a process session.
+type ActivityCorrelation string
+
+const (
+	CorrelationDirect      ActivityCorrelation = "direct"
+	CorrelationApplication ActivityCorrelation = "app-level"
+	CorrelationInferred    ActivityCorrelation = "inferred"
+)
+
+// AgentActivity is a redacted, ephemeral projection of one Codex rollout.
+type AgentActivity struct {
+	ThreadID      string
+	Tool          Tool
+	Workspace     string
+	Model         string
+	LastTool      string
+	State         ActivityState
+	Correlation   ActivityCorrelation
+	StartedAt     time.Time
+	UpdatedAt     time.Time
+	ContextTokens int64
+	ContextWindow int64
+}
+
+// ActivityMatchHint contains only explicit process arguments useful for correlation.
+type ActivityMatchHint struct {
+	ThreadID  string
+	Workspace string
+}
+
 // ProcessIdentity protects process operations from PID reuse.
 type ProcessIdentity struct {
 	PID       uint32
@@ -63,16 +103,18 @@ type ResourceUsage struct {
 
 // Session is the in-memory representation of a tracked tool session.
 type Session struct {
-	ID         string
-	Tool       Tool
-	Confidence Confidence
-	JobName    string
-	Workspace  string
-	Root       ProcessIdentity
-	StartedAt  time.Time
-	Processes  []Process
-	State      State
-	Resources  ResourceUsage
+	ID                string
+	Tool              Tool
+	Confidence        Confidence
+	JobName           string
+	Workspace         string
+	Root              ProcessIdentity
+	StartedAt         time.Time
+	Processes         []Process
+	State             State
+	Resources         ResourceUsage
+	Activities        []AgentActivity
+	ActivityMatchHint ActivityMatchHint
 }
 
 // DeriveState derives a session state from its current job process snapshot.

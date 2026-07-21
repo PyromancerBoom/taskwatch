@@ -150,6 +150,17 @@ type fakeObserver struct {
 	calls   []map[uint32]core.ProcessIdentity
 }
 
+type fakeActivityCollector struct {
+	activities []core.AgentActivity
+	err        error
+	calls      []time.Time
+}
+
+func (collector *fakeActivityCollector) Collect(now time.Time) ([]core.AgentActivity, error) {
+	collector.calls = append(collector.calls, now)
+	return append([]core.AgentActivity(nil), collector.activities...), collector.err
+}
+
 func (observer *fakeObserver) Observe(excluded map[uint32]core.ProcessIdentity) ([]core.Session, error) {
 	copyOfExcluded := make(map[uint32]core.ProcessIdentity, len(excluded))
 	for pid, identity := range excluded {
@@ -182,6 +193,140 @@ func TestStartEmptyStoreObservesWithoutRecoveryOrSave(t *testing.T) {
 		t.Fatalf("Observe calls/exclusions = %#v, want one empty exclusion map", observer.calls)
 	}
 	assertSnapshot(t, snapshot, "C:/work", []string{"desktop"}, nil, cycleOne)
+}
+
+func TestStartCollectsAndAttachesDesktopActivityWithoutChangingProcessFacts(t *testing.T) {
+	store := &fakeStore{}
+	processSnapshot := process(71, baseTime)
+	observed := session("desktop", core.ConfidenceObserved, core.StateRunning, baseTime, processSnapshot)
+	observed.Tool = core.ToolCodexDesktop
+	observer := &fakeObserver{results: []observation{{sessions: []core.Session{observed}}}}
+	collector := &fakeActivityCollector{activities: []core.AgentActivity{{
+		ThreadID: "thread", Tool: core.ToolCodexDesktop, State: core.ActivityExecuting, UpdatedAt: cycleOne,
+	}}}
+	coordinator := newCoordinatorWithActivity("C:/work", store, &fakeSupervisor{}, observer, collector, func() time.Time { return cycleOne })
+
+	snapshot, err := coordinator.Start()
+	if err != nil {
+		t.Fatalf("Start() error = %v", err)
+	}
+	got := findSession(t, snapshot.Sessions, "desktop")
+	if len(got.Activities) != 1 || got.Activities[0].Correlation != core.CorrelationApplication {
+		t.Fatalf("desktop activities = %#v", got.Activities)
+	}
+	if !reflect.DeepEqual(got.Processes, observed.Processes) || got.Resources != observed.Resources || got.State != observed.State {
+		t.Fatalf("activity changed process facts: got %#v want %#v", got, observed)
+	}
+	if len(collector.calls) != 1 || !collector.calls[0].Equal(cycleOne) || store.saveCalls != 0 {
+		t.Fatalf("collector/save calls = %#v/%d", collector.calls, store.saveCalls)
+	}
+}
+
+func TestStartKeepsUsableActivityWhenCollectorWarnsAndDoesNotPersist(t *testing.T) {
+	store := &fakeStore{}
+	observed := session("desktop", core.ConfidenceObserved, core.StateRunning, baseTime, process(71, baseTime))
+	observed.Tool = core.ToolCodexDesktop
+	observer := &fakeObserver{results: []observation{{sessions: []core.Session{observed}}}}
+	collector := &fakeActivityCollector{
+		activities: []core.AgentActivity{{ThreadID: "thread", Tool: core.ToolCodexDesktop, State: core.ActivityUnknown, UpdatedAt: cycleOne}},
+		err:        errors.New("compressed active rollout ignored"),
+	}
+	coordinator := newCoordinatorWithActivity("C:/work", store, &fakeSupervisor{}, observer, collector, func() time.Time { return cycleOne })
+
+	snapshot, err := coordinator.Start()
+	if err != nil {
+		t.Fatalf("Start() error = %v", err)
+	}
+	got := findSession(t, snapshot.Sessions, "desktop")
+	if len(got.Activities) != 1 || got.State != observed.State || !reflect.DeepEqual(got.Processes, observed.Processes) {
+		t.Fatalf("partial activity changed/dropped session = %#v", got)
+	}
+	if len(snapshot.Warnings) != 1 || !strings.Contains(snapshot.Warnings[0].Message, "compressed active rollout ignored") || store.saveCalls != 0 {
+		t.Fatalf("warnings/save = %#v/%d", snapshot.Warnings, store.saveCalls)
+	}
+}
+
+func TestCollectActivitiesDropsRowsOutsideVisibilityWindow(t *testing.T) {
+	coordinator := &Coordinator{
+		activityCollector: &fakeActivityCollector{activities: []core.AgentActivity{
+			{ThreadID: "fresh", Tool: core.ToolCodexDesktop, UpdatedAt: cycleOne.Add(-15 * time.Minute)},
+			{ThreadID: "expired", Tool: core.ToolCodexDesktop, UpdatedAt: cycleOne.Add(-15*time.Minute - time.Nanosecond)},
+			{ThreadID: "undated", Tool: core.ToolCodexDesktop},
+		}},
+		activityMatches: make(map[string]activityMatch),
+		observed:        []core.Session{{ID: "desktop", Tool: core.ToolCodexDesktop, State: core.StateRunning}},
+	}
+	coordinator.collectActivities(cycleOne)
+	if got := coordinator.observed[0].Activities; len(got) != 1 || got[0].ThreadID != "fresh" {
+		t.Fatalf("visible activities = %#v, want only boundary-fresh row", got)
+	}
+}
+
+func TestAttachActivitiesCorrelatesCLIByDirectWorkspaceAndTimeOneToOne(t *testing.T) {
+	threadDirect := "019f8390-4743-72a1-9df8-d780c4964fce"
+	coordinator := &Coordinator{
+		activityMatches: make(map[string]activityMatch),
+		supervised: []core.Session{
+			{ID: "direct", Tool: core.ToolCodexCLI, State: core.StateRunning, Root: core.ProcessIdentity{PID: 1, CreatedAt: baseTime}, StartedAt: baseTime, ActivityMatchHint: core.ActivityMatchHint{ThreadID: threadDirect}},
+			{ID: "workspace", Tool: core.ToolCodexCLI, State: core.StateRunning, Root: core.ProcessIdentity{PID: 2, CreatedAt: baseTime}, StartedAt: baseTime.Add(time.Minute), Workspace: `C:\repo`},
+		},
+		observed: []core.Session{
+			{ID: "timed", Tool: core.ToolCodexCLI, State: core.StateRunning, Root: core.ProcessIdentity{PID: 3, CreatedAt: baseTime}, StartedAt: baseTime.Add(2 * time.Minute)},
+		},
+	}
+	activities := []core.AgentActivity{
+		{ThreadID: threadDirect, Tool: core.ToolCodexCLI, Workspace: `C:\other`, StartedAt: baseTime.Add(30 * time.Second), UpdatedAt: cycleOne},
+		{ThreadID: "workspace-thread", Tool: core.ToolCodexCLI, Workspace: `c:\REPO`, StartedAt: baseTime.Add(time.Minute), UpdatedAt: cycleOne},
+		{ThreadID: "timed-thread", Tool: core.ToolCodexCLI, Workspace: `C:\timed`, StartedAt: baseTime.Add(2*time.Minute + 30*time.Second), UpdatedAt: cycleOne},
+	}
+
+	coordinator.attachActivities(activities)
+
+	if got := coordinator.supervised[0].Activities; len(got) != 1 || got[0].ThreadID != threadDirect || got[0].Correlation != core.CorrelationDirect {
+		t.Fatalf("direct activities = %#v", got)
+	}
+	if got := coordinator.supervised[1].Activities; len(got) != 1 || got[0].ThreadID != "workspace-thread" || got[0].Correlation != core.CorrelationInferred {
+		t.Fatalf("workspace activities = %#v", got)
+	}
+	if got := coordinator.observed[0].Activities; len(got) != 1 || got[0].ThreadID != "timed-thread" || got[0].Correlation != core.CorrelationInferred {
+		t.Fatalf("timed activities = %#v", got)
+	}
+}
+
+func TestAttachActivitiesUsesStickyWorkspaceForLaterThreadAndRejectsDistantStart(t *testing.T) {
+	root := core.ProcessIdentity{PID: 3, CreatedAt: baseTime}
+	coordinator := &Coordinator{
+		activityMatches: make(map[string]activityMatch),
+		observed:        []core.Session{{ID: "cli", Tool: core.ToolCodexCLI, State: core.StateRunning, Root: root, StartedAt: baseTime}},
+	}
+	coordinator.attachActivities([]core.AgentActivity{{ThreadID: "first", Tool: core.ToolCodexCLI, Workspace: `C:\repo`, StartedAt: baseTime.Add(30 * time.Second), UpdatedAt: cycleOne}})
+	if got := coordinator.observed[0].Activities; len(got) != 1 || got[0].ThreadID != "first" {
+		t.Fatalf("first match = %#v", got)
+	}
+	coordinator.attachActivities([]core.AgentActivity{{ThreadID: "later", Tool: core.ToolCodexCLI, Workspace: `c:\REPO`, StartedAt: baseTime.Add(time.Hour), UpdatedAt: cycleTwo}})
+	if got := coordinator.observed[0].Activities; len(got) != 1 || got[0].ThreadID != "later" || got[0].Correlation != core.CorrelationInferred {
+		t.Fatalf("sticky workspace match = %#v", got)
+	}
+
+	other := &Coordinator{
+		activityMatches: make(map[string]activityMatch),
+		observed:        []core.Session{{ID: "distant", Tool: core.ToolCodexCLI, State: core.StateRunning, Root: core.ProcessIdentity{PID: 4, CreatedAt: baseTime}, StartedAt: baseTime}},
+	}
+	other.attachActivities([]core.AgentActivity{{ThreadID: "too-late", Tool: core.ToolCodexCLI, StartedAt: baseTime.Add(61 * time.Second), UpdatedAt: cycleOne}})
+	if len(other.observed[0].Activities) != 0 {
+		t.Fatalf("distant activity matched = %#v", other.observed[0].Activities)
+	}
+}
+
+func TestAttachActivitiesDoesNotGuessBetweenDesktopRoots(t *testing.T) {
+	coordinator := &Coordinator{observed: []core.Session{
+		{ID: "one", Tool: core.ToolCodexDesktop, State: core.StateRunning},
+		{ID: "two", Tool: core.ToolCodexDesktop, State: core.StateRunning},
+	}}
+	coordinator.attachActivities([]core.AgentActivity{{ThreadID: "desktop", Tool: core.ToolCodexDesktop}})
+	if len(coordinator.observed[0].Activities) != 0 || len(coordinator.observed[1].Activities) != 0 {
+		t.Fatalf("ambiguous Desktop activity attached = %#v", coordinator.observed)
+	}
 }
 
 func TestStartPassesOnlyValidSelfIdentityToObserver(t *testing.T) {
@@ -321,7 +466,7 @@ func TestStartObservationFailureIsNonfatalAndKeepsSupervisedRows(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Start() error = %v", err)
 	}
-	assertSnapshot(t, snapshot, "workspace", []string{"supervised"}, []Warning{{Message: "observe desktop sessions: snapshot failed"}}, cycleOne)
+	assertSnapshot(t, snapshot, "workspace", []string{"supervised"}, []Warning{{Message: "observe Codex sessions: snapshot failed"}}, cycleOne)
 }
 
 func TestStartLoadFailureIsFatalAndPathBearing(t *testing.T) {
@@ -464,7 +609,7 @@ func TestRefreshObservationSuccessReplacesAndFailureRetainsStaleRows(t *testing.
 	if gotNew.State != core.StateStale {
 		t.Fatalf("retained observed state = %q, want stale", gotNew.State)
 	}
-	assertWarnings(t, retained.Warnings, []Warning{{Message: "observe desktop sessions: desktop snapshot unavailable"}})
+	assertWarnings(t, retained.Warnings, []Warning{{Message: "observe Codex sessions: desktop snapshot unavailable"}})
 }
 
 func TestRefreshNewlyExitedSavesOnlyNonExitedAndSaveFailureWarns(t *testing.T) {
@@ -1252,7 +1397,7 @@ func TestRefreshAfterCloseReturnsCopiedSnapshotWithoutAccessingDependencies(t *t
 	if len(supervisor.refreshCalls) != 0 || len(observer.calls) != 1 {
 		t.Errorf("dependency calls after Close() = refresh %d, observe %d; want unchanged 0, 1", len(supervisor.refreshCalls), len(observer.calls))
 	}
-	assertSnapshot(t, got, "workspace", []string{"managed"}, []Warning{{Message: "observe desktop sessions: observer unavailable"}}, cycleOne)
+	assertSnapshot(t, got, "workspace", []string{"managed"}, []Warning{{Message: "observe Codex sessions: observer unavailable"}}, cycleOne)
 
 	got.Sessions[0].Processes[0].Name = "mutated"
 	got.Warnings[0].Message = "mutated"

@@ -4,11 +4,12 @@ TaskWatch v0.1.0-preview is a Windows 10/11 x64 technical preview for inspecting
 
 ## What it supports
 
-- Observation of the packaged Codex Desktop application's current validated process tree.
+- Read-only auto-detection of the packaged Codex Desktop application and external Codex CLI agent processes.
 - Supervised launches of Claude Code and Codex CLI from a workspace you choose in TaskWatch.
+- Recent, redacted Codex activity (state, tool, model, and context usage) from active rollout files.
 - Read-only process-tree inspection, refresh, and restart recovery for eligible supervised sessions.
 
-For CLI supervision, launch Claude Code or Codex CLI through TaskWatch. Existing CLI processes are not discovered or adopted.
+For Job Object supervision, launch Claude Code or Codex CLI through TaskWatch. Existing Codex CLI processes are detected automatically but remain observed and ephemeral; they are never adopted into supervision. Existing Claude Code processes are not discovered.
 
 ## Prerequisites
 
@@ -59,20 +60,22 @@ TaskWatch stores state under `%LOCALAPPDATA%\TaskWatch`:
 - `sessions.json` contains schema-versioned metadata for supervised-session recovery.
 - `workspaces.json` contains the independently versioned list of recent launch workspaces.
 
-Codex Desktop observations are deliberately not persisted: they are valid only while TaskWatch can currently validate the desktop process family.
+Observed Codex Desktop/CLI sessions and rollout activity are deliberately not persisted: they are valid only while TaskWatch can currently validate the process family and recent activity files.
 
 ## Limitations of this preview
 
 - There is no user-facing termination or safe-exit flow. The `k` and `q` keys do not terminate or close sessions outside the workspace editor.
-- Only CLI sessions launched through TaskWatch are supervised; already-running Claude Code and Codex CLI sessions are not found.
+- Only CLI sessions launched through TaskWatch are supervised. Already-running Codex CLI sessions are observed automatically; already-running Claude Code sessions are not found.
 - Restart recovery remains available while the supervised session's Job Object still has running processes.
 - Codex Desktop observation covers only its current validated application tree, not historical sessions or detached/rootless processes.
+- Codex activity reads only active `.jsonl` rollout files from the last 15 minutes. Cold `.zst` history and subagent rollouts are deliberately skipped.
+- Prompts, assistant text, tool-argument values, command lines, cumulative token/cost analytics, and subagent hierarchy are never displayed or retained as activity.
 - Protected or elevated processes can be visible but inaccessible to TaskWatch running as a standard user.
 - Windows 10/11 x64 is the only supported preview target.
 
 ## Safety
 
-TaskWatch exposes no process-cleanup or termination action in this preview. Its inspection views are read-only. Closing TaskWatch does not close supervised applications, and the Job Objects it uses are not configured to kill processes when TaskWatch exits.
+TaskWatch exposes no process-cleanup or termination action in this preview. Its inspection views and rollout enrichment are read-only. Activity correlation, including visibly labeled inferred matches, never changes process identity, lifecycle, resources, persistence, or any future termination decision. Closing TaskWatch does not close supervised applications, and the Job Objects it uses are not configured to kill processes when TaskWatch exits.
 
 The project’s safety model is designed around exact process identity (PID plus creation time), conservative handling of unreadable metadata, and explicit user confirmation before any future termination capability could be made available.
 

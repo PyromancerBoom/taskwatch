@@ -3,6 +3,7 @@ package tui
 import (
 	"errors"
 	"fmt"
+	"sort"
 	"strings"
 	"time"
 
@@ -453,7 +454,7 @@ func (m Model) render() string {
 	detailLines := 0
 	selected, hasSelection := m.selectedSession()
 	if hasSelection {
-		detailLines = detailPanelLineCount()
+		detailLines = detailPanelLineCountFor(selected)
 	}
 	plan := planLayout(width, height, len(headerLines), m.actionErr != nil || len(m.snapshot.Warnings) > 0, headingEligible, hasSessions, detailLines)
 
@@ -683,7 +684,7 @@ func (m Model) renderInspection(width, height int) string {
 	lines = append(lines, context...)
 	remaining -= len(context)
 
-	if width >= 110 && remaining > 0 {
+	if width >= 110 && remaining > 0 && !m.hasInspectionActivities() {
 		lines = append(lines, m.palette.muted.Render(clip(inspectionHeading(), width)))
 		remaining--
 	}
@@ -738,6 +739,78 @@ func inspectionHeading() string {
 	return fmt.Sprintf("%-40s %-8s %-8s %-8s %-10s %-10s", "PROCESS", "PID", "PARENT", "START", "CPU", "MEMORY")
 }
 
+func activityHeading() string {
+	return fmt.Sprintf("%-9s %-10s %-12s %-14s %-7s %-8s %-10s %s", "THREAD", "STATE", "LAST TOOL", "MODEL", "CTX", "UPDATED", "MATCH", "WORKSPACE")
+}
+
+func (m Model) hasInspectionActivities() bool {
+	return len(m.inspectionSession().Activities) > 0
+}
+
+func (m Model) inspectionCombinedLines(width int) []string {
+	activities := append([]core.AgentActivity(nil), m.inspectionSession().Activities...)
+	sort.SliceStable(activities, func(i, j int) bool { return activities[i].UpdatedAt.After(activities[j].UpdatedAt) })
+	lines := []string{m.palette.focus.Render(clip("AGENT ACTIVITY", width))}
+	if width >= 110 {
+		lines = append(lines, m.palette.muted.Render(clip(activityHeading(), width)))
+	}
+	for _, activity := range activities {
+		lines = append(lines, m.renderInspectionActivity(activity, width)...)
+	}
+	lines = append(lines, "", m.palette.focus.Render(clip("PROCESS TREE", width)))
+	if width >= 110 {
+		lines = append(lines, m.palette.muted.Render(clip(inspectionHeading(), width)))
+	}
+	compact := !m.inspectionRaw && m.inspectionTree.CompactRows != nil
+	if compact {
+		for _, row := range m.inspectionTree.CompactRows {
+			lines = append(lines, m.renderCompactInspectionProcess(row, width)...)
+		}
+	} else {
+		for _, row := range m.inspectionTree.Rows {
+			lines = append(lines, m.renderInspectionProcess(row, width)...)
+		}
+	}
+	if (compact && len(m.inspectionTree.CompactRows) == 0) || (!compact && len(m.inspectionTree.Rows) == 0) {
+		lines = append(lines, m.palette.muted.Render(clip("No processes remain for this session.", width)))
+	}
+	return lines
+}
+
+func (m Model) renderInspectionActivity(activity core.AgentActivity, width int) []string {
+	value := func(value string) string {
+		if value == "" {
+			return "—"
+		}
+		return value
+	}
+	threadID := activity.ThreadID
+	if len(threadID) > 8 {
+		threadID = threadID[:8]
+	}
+	context := activityContextLabel(activity)
+	updated := "—"
+	if !activity.UpdatedAt.IsZero() {
+		updated = ageLabel(activity.UpdatedAt, m.now())
+	}
+	if width >= 110 {
+		line := fmt.Sprintf("%-9s %-10s %-12s %-14s %-7s %-8s %-10s %s",
+			value(threadID), value(string(activity.State)), value(activity.LastTool), value(activity.Model), context,
+			updated, value(string(activity.Correlation)), value(activity.Workspace))
+		return []string{m.palette.text.Render(clip(line, width))}
+	}
+	first := strings.Join([]string{value(threadID), value(string(activity.State)), value(activity.LastTool), context}, " · ")
+	second := strings.Join([]string{value(activity.Model), updated, value(string(activity.Correlation)), value(activity.Workspace)}, " · ")
+	return []string{m.palette.text.Render(clip(first, width)), m.palette.muted.Render(clip(second, width))}
+}
+
+func activityContextLabel(activity core.AgentActivity) string {
+	if activity.ContextWindow <= 0 || activity.ContextTokens < 0 {
+		return "—"
+	}
+	return fmt.Sprintf("%.1f%%", float64(activity.ContextTokens)/float64(activity.ContextWindow)*100)
+}
+
 func (m Model) renderInspectionViewport(width, viewportLines int) []string {
 	if viewportLines <= 0 {
 		return nil
@@ -760,6 +833,28 @@ func (m Model) renderInspectionViewport(width, viewportLines int) []string {
 		if errors.Is(m.inspectionErr, app.ErrSessionNotFound) || total == 0 || len(body) >= viewportLines {
 			return body[:min(len(body), viewportLines)]
 		}
+	}
+	if m.hasInspectionActivities() {
+		content := m.inspectionCombinedLines(width)
+		budget := viewportLines - len(body)
+		if budget <= 0 {
+			return body[:min(len(body), viewportLines)]
+		}
+		start := min(max(m.inspectionScrollOffset, 0), max(len(content)-1, 0))
+		if start > 0 && budget > 0 {
+			body = append(body, m.palette.muted.Render(clip(fmt.Sprintf("↑ %d more", start), width)))
+			budget--
+		}
+		end := min(len(content), start+budget)
+		showBelow := end < len(content)
+		if showBelow && end > start && budget > 0 {
+			end--
+		}
+		body = append(body, content[start:end]...)
+		if showBelow && len(body) < viewportLines {
+			body = append(body, m.palette.muted.Render(clip(fmt.Sprintf("↓ %d more", len(content)-end), width)))
+		}
+		return body[:min(len(body), viewportLines)]
 	}
 	if total == 0 {
 		body = append(body, m.palette.muted.Render(clip("No processes remain for this session.", width)))
@@ -1028,7 +1123,7 @@ func (m Model) renderViewport(width int, plan layoutPlan) []string {
 	sessions := m.snapshot.Sessions
 	if len(sessions) == 0 {
 		body = renderWrapped(m.palette.text, "No sessions yet", width)
-		body = append(body, renderWrapped(m.palette.muted, "Codex Desktop is watched as one application/process tree. Claude and Codex CLI sessions are shown only when launched through TaskWatch. Refreshing every 2 seconds.", width)...)
+		body = append(body, renderWrapped(m.palette.muted, "Codex Desktop is watched as one application/process tree. Existing Codex CLI sessions are observed automatically; Claude sessions are shown when launched through TaskWatch. Refreshing every 2 seconds.", width)...)
 	} else {
 		start, end, showAbove, showBelow := sessionWindow(len(sessions), m.scrollOffset, plan.viewportLines, plan.rowsPerSession)
 
@@ -1041,7 +1136,7 @@ func (m Model) renderViewport(width int, plan layoutPlan) []string {
 				body = append(body, m.renderRow(session, fullRow(session, m.now()), width))
 			case width >= 80:
 				body = append(body, m.renderRow(session, mediumRow(session, m.now()), width))
-				body = append(body, m.palette.muted.Render(clip("    "+folder(session), width)))
+				body = append(body, m.palette.muted.Render(clip("    "+mediumDetailRow(session, m.now()), width)))
 			default:
 				first, second := narrowRows(session, m.now())
 				body = append(body, m.renderRow(session, first, width))
@@ -1059,11 +1154,9 @@ func (m Model) renderViewport(width int, plan layoutPlan) []string {
 	return append(lines, body...)
 }
 
-// detailPanelFieldCount is the number of labeled field lines drawn inside the
-// selected-row detail panel, below its title line. Kept as a constant so the
-// panel's line cost (see detailPanelLineCount) does not depend on session
-// data or width: it is either fully shown or fully hidden, never partially
-// wrapped.
+// detailPanelFieldCount is the number of process/session field lines drawn
+// below the panel title. Activity adds two more lines only when available, so
+// sessions without enrichment retain the previous panel height.
 const detailPanelFieldCount = 8
 
 // detailPanelLineCount is the detail panel's real rendered line count,
@@ -1073,6 +1166,13 @@ const detailPanelFieldCount = 8
 func detailPanelLineCount() int {
 	const borderLines = 2
 	return borderLines + 1 + detailPanelFieldCount
+}
+
+func detailPanelLineCountFor(session core.Session) int {
+	if len(session.Activities) > 0 {
+		return detailPanelLineCount() + 2
+	}
+	return detailPanelLineCount()
 }
 
 // detailPanelContentWidth returns how many columns are left for panel text
@@ -1132,6 +1232,12 @@ func (m Model) renderDetailPanel(width int, session core.Session) string {
 		field("CPU", cpuCell(session)),
 		field("Memory", memoryLabel(session.Resources)),
 	}
+	if len(session.Activities) > 0 {
+		lines = append(lines,
+			field("Activity", activityDetail(session)),
+			field("Model/context", modelContextDetail(session)),
+		)
+	}
 
 	panel := lipgloss.NewStyle().
 		Border(lipgloss.RoundedBorder()).
@@ -1178,30 +1284,126 @@ func wrapDisplayWidth(value string, width int) []string {
 }
 
 func fullHeading() string {
-	return fmt.Sprintf("  %-13s %-10s %-12s %-9s %-12s %-10s %-5s %s", "APP", "TRACKING", "STATUS", "PROCESSES", "CPU", "WS MEMORY", "AGE", "FOLDER")
+	return fmt.Sprintf("  %-22s %-11s %-23s %-9s %-12s %-10s %-7s %-5s %s", "APP / TRACKING", "STATUS", "ACTIVITY", "PROCESSES", "CPU", "WS MEMORY", "CTX", "AGE", "FOLDER")
 }
 
 func fullRow(session core.Session, now time.Time) string {
-	return fmt.Sprintf("  %-13s %-10s %-12s %-9d %-12s %-10s %-5s %s",
-		toolLabel(session.Tool), trackingLabel(session.Confidence), string(session.State), len(session.Processes),
-		cpuCell(session), memoryLabel(session.Resources), ageLabel(session.StartedAt, now), folder(session))
+	return fmt.Sprintf("  %-22s %-11s %-23s %-9d %-12s %-10s %-7s %-5s %s",
+		toolLabel(session.Tool)+" / "+trackingLabel(session.Confidence), string(session.State), activitySummary(session), len(session.Processes),
+		cpuCell(session), memoryLabel(session.Resources), sessionContextLabel(session), ageLabel(session.StartedAt, now), folder(session))
 }
 
 func mediumHeading() string {
-	return fmt.Sprintf("  %-13s %-10s %-12s %-4s %-12s %-9s %-4s", "APP", "TRACKING", "STATUS", "PROC", "CPU", "WS MEMORY", "AGE")
+	return fmt.Sprintf("  %-22s %-11s %-23s %-4s %-7s", "APP / TRACKING", "STATUS", "ACTIVITY", "PROC", "CTX")
 }
 
 func mediumRow(session core.Session, now time.Time) string {
-	return fmt.Sprintf("  %-13s %-10s %-12s %-4d %-12s %-9s %-4s",
-		toolLabel(session.Tool), trackingLabel(session.Confidence), string(session.State), len(session.Processes),
-		cpuCell(session), memoryLabel(session.Resources), ageLabel(session.StartedAt, now))
+	return fmt.Sprintf("  %-22s %-11s %-23s %-4d %-7s",
+		toolLabel(session.Tool)+" / "+trackingLabel(session.Confidence), string(session.State), activitySummary(session), len(session.Processes), sessionContextLabel(session))
+}
+
+func mediumDetailRow(session core.Session, now time.Time) string {
+	return fmt.Sprintf("%s · %s · %s · %s", cpuCell(session), memoryLabel(session.Resources), ageLabel(session.StartedAt, now), folder(session))
 }
 
 func narrowRows(session core.Session, now time.Time) (string, string) {
-	first := fmt.Sprintf("  %s  %s", toolLabel(session.Tool), string(session.State))
-	second := fmt.Sprintf("  %s %dp %s %s %s %s", trackingLabel(session.Confidence), len(session.Processes),
-		cpuLabel(session), memoryLabel(session.Resources), ageLabel(session.StartedAt, now), folder(session))
+	first := fmt.Sprintf("  %s  %s · %s", toolLabel(session.Tool), string(session.State), activitySummary(session))
+	second := fmt.Sprintf("  %s %dp %s %s ctx %s %s %s", trackingLabel(session.Confidence), len(session.Processes),
+		cpuLabel(session), memoryLabel(session.Resources), sessionContextLabel(session), ageLabel(session.StartedAt, now), folder(session))
 	return first, second
+}
+
+func activitySummary(session core.Session) string {
+	if len(session.Activities) == 0 {
+		return "—"
+	}
+	if session.Tool != core.ToolCodexDesktop || len(session.Activities) == 1 {
+		activity := mostRecentActivity(session.Activities)
+		if activity.LastTool != "" {
+			return string(activity.State) + " · " + activity.LastTool
+		}
+		return string(activity.State)
+	}
+	counts := make(map[core.ActivityState]int)
+	for _, activity := range session.Activities {
+		counts[activity.State]++
+	}
+	var parts []string
+	for _, state := range []core.ActivityState{core.ActivityExecuting, core.ActivityThinking, core.ActivityWaiting, core.ActivityUnknown} {
+		if count := counts[state]; count > 0 {
+			parts = append(parts, fmt.Sprintf("%d %s", count, state))
+		}
+	}
+	return strings.Join(parts, " · ")
+}
+
+func activityDetail(session core.Session) string {
+	if len(session.Activities) == 0 {
+		return "—"
+	}
+	value := activitySummary(session)
+	if len(session.Activities) == 1 && session.Activities[0].Correlation != "" {
+		value += " · " + string(session.Activities[0].Correlation)
+	}
+	return value
+}
+
+func modelContextDetail(session core.Session) string {
+	if len(session.Activities) == 0 {
+		return "—"
+	}
+	activity, hasContext := highestContextActivity(session.Activities)
+	if !hasContext {
+		activity = mostRecentActivity(session.Activities)
+	}
+	model := activity.Model
+	if model == "" {
+		model = "—"
+	}
+	return model + " · " + activityContextLabel(activity)
+}
+
+func highestContextActivity(activities []core.AgentActivity) (core.AgentActivity, bool) {
+	var best core.AgentActivity
+	bestRatio := -1.0
+	for _, activity := range activities {
+		if activity.ContextWindow <= 0 || activity.ContextTokens < 0 {
+			continue
+		}
+		ratio := float64(activity.ContextTokens) / float64(activity.ContextWindow)
+		if ratio > bestRatio || ratio == bestRatio && activity.UpdatedAt.After(best.UpdatedAt) {
+			best = activity
+			bestRatio = ratio
+		}
+	}
+	return best, bestRatio >= 0
+}
+
+func sessionContextLabel(session core.Session) string {
+	best := -1.0
+	for _, activity := range session.Activities {
+		if activity.ContextWindow <= 0 || activity.ContextTokens < 0 {
+			continue
+		}
+		percentage := float64(activity.ContextTokens) / float64(activity.ContextWindow) * 100
+		if percentage > best {
+			best = percentage
+		}
+	}
+	if best < 0 {
+		return "—"
+	}
+	return fmt.Sprintf("%.1f%%", best)
+}
+
+func mostRecentActivity(activities []core.AgentActivity) core.AgentActivity {
+	latest := activities[0]
+	for _, activity := range activities[1:] {
+		if activity.UpdatedAt.After(latest.UpdatedAt) {
+			latest = activity
+		}
+	}
+	return latest
 }
 
 // renderRow draws one session line: a selection marker, a status dot colored by

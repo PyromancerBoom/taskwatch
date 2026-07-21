@@ -167,7 +167,7 @@ func TestNarrowEmptyCopyWrapsWithoutLosingText(t *testing.T) {
 	if !strings.Contains(plain, "No sessions yet") {
 		t.Fatalf("width-%d empty view lost headline:\n%s", width, content)
 	}
-	if !strings.Contains(plain, "Codex Desktop is watched as one application/process tree. Claude and Codex CLI sessions are shown only when launched through TaskWatch. Refreshing every 2 seconds.") {
+	if !strings.Contains(plain, "Codex Desktop is watched as one application/process tree. Existing Codex CLI sessions are observed automatically; Claude sessions are shown when launched through TaskWatch. Refreshing every 2 seconds.") {
 		t.Fatalf("width-%d empty view lost body copy:\n%s", width, content)
 	}
 }
@@ -407,7 +407,7 @@ func TestNarrowLongWarningKeepsMoreSuffixVisible(t *testing.T) {
 func TestEmptyAndBlockingErrorCopy(t *testing.T) {
 	empty := testModel(100, nil).View().Content
 	emptyPlain := flattenRendered(empty)
-	if !strings.Contains(emptyPlain, "No sessions yet") || !strings.Contains(emptyPlain, "Codex Desktop is watched as one application/process tree. Claude and Codex CLI sessions are shown only when launched through TaskWatch. Refreshing every 2 seconds.") {
+	if !strings.Contains(emptyPlain, "No sessions yet") || !strings.Contains(emptyPlain, "Codex Desktop is watched as one application/process tree. Existing Codex CLI sessions are observed automatically; Claude sessions are shown when launched through TaskWatch. Refreshing every 2 seconds.") {
 		t.Fatalf("empty view missing exact copy:\n%s", empty)
 	}
 
@@ -934,6 +934,135 @@ func TestInspectionCompactRowsAndRawToggleRenderDistinctViews(t *testing.T) {
 	for _, forbidden := range []string{"Codex agent host", "+3 shell/helper processes", "secret raw command"} {
 		if strings.Contains(plain, forbidden) {
 			t.Fatalf("raw view exposed compact/command-line text %q:\n%s", forbidden, model.View().Content)
+		}
+	}
+}
+
+func TestDashboardShowsCodexActivityAndContextAtWideAndNarrowWidths(t *testing.T) {
+	session := detailedSession()
+	session.Confidence = core.ConfidenceObserved
+	session.Activities = []core.AgentActivity{{
+		ThreadID: "019f8390-4743-72a1-9df8-d780c4964fce", State: core.ActivityExecuting,
+		LastTool: "exec", Model: "gpt-5.6", Correlation: core.CorrelationInferred,
+		ContextTokens: 82069, ContextWindow: 258400, UpdatedAt: time.Date(2026, 7, 15, 3, 4, 5, 0, time.UTC),
+	}}
+	for _, width := range []int{130, 70} {
+		t.Run(fmt.Sprintf("width_%d", width), func(t *testing.T) {
+			model := testModel(width, []core.Session{session})
+			model.height = 24
+			plain := flattenRendered(model.View().Content)
+			for _, want := range []string{"executing", "exec", "31.8%"} {
+				if !strings.Contains(plain, want) {
+					t.Fatalf("width %d missing %q:\n%s", width, want, model.View().Content)
+				}
+			}
+			assertWithinWidth(t, model.View().Content, width)
+		})
+	}
+	model := testModel(130, []core.Session{session})
+	model.height = 30
+	plain := flattenRendered(model.View().Content)
+	for _, want := range []string{"Activity:", "inferred", "Model/context:", "gpt-5.6"} {
+		if !strings.Contains(plain, want) {
+			t.Fatalf("detail panel missing %q:\n%s", want, model.View().Content)
+		}
+	}
+}
+
+func TestDashboardSummarizesMultipleDesktopActivities(t *testing.T) {
+	session := detailedSession()
+	session.Tool = core.ToolCodexDesktop
+	session.Activities = []core.AgentActivity{
+		{ThreadID: "one", State: core.ActivityExecuting, ContextTokens: 50, ContextWindow: 100},
+		{ThreadID: "two", State: core.ActivityExecuting, ContextTokens: 20, ContextWindow: 100},
+		{ThreadID: "three", State: core.ActivityWaiting, ContextTokens: 75, ContextWindow: 100},
+	}
+	model := testModel(150, []core.Session{session})
+	model.height = 24
+	plain := flattenRendered(model.View().Content)
+	for _, want := range []string{"2 executing", "1 waiting", "75.0%"} {
+		if !strings.Contains(plain, want) {
+			t.Fatalf("Desktop summary missing %q:\n%s", want, model.View().Content)
+		}
+	}
+}
+
+func TestSelectedDesktopModelAndContextComeFromSameHighestContextActivity(t *testing.T) {
+	session := detailedSession()
+	session.Tool = core.ToolCodexDesktop
+	now := time.Date(2026, 7, 21, 12, 0, 0, 0, time.UTC)
+	session.Activities = []core.AgentActivity{
+		{ThreadID: "high", Model: "model-high-context", ContextTokens: 75, ContextWindow: 100, UpdatedAt: now.Add(-time.Minute)},
+		{ThreadID: "new", Model: "model-most-recent", ContextTokens: 10, ContextWindow: 100, UpdatedAt: now},
+	}
+
+	model := testModel(150, []core.Session{session})
+	model.height = 30
+	plain := flattenRendered(model.View().Content)
+	if !strings.Contains(plain, "Model/context: model-high-context · 75.0%") {
+		t.Fatalf("selected detail does not pair the highest context with its model:\n%s", model.View().Content)
+	}
+	if strings.Contains(plain, "Model/context: model-most-recent · 75.0%") {
+		t.Fatalf("selected detail paired a model with another activity's context:\n%s", model.View().Content)
+	}
+}
+
+func TestInspectionShowsActivitySectionAboveCompactAndRawProcessRows(t *testing.T) {
+	created := time.Date(2026, 7, 15, 1, 2, 3, 0, time.UTC)
+	tree := inspectionTreeWithRows([]core.ProcessTreeRow{{Process: core.Process{
+		PID: 42, ParentPID: 1, Name: "codex.exe", CommandLine: "secret prompt", CreatedAt: created,
+		CPUPercent: 7.5, MemoryBytes: 1572864, CPUAvailable: true, MemoryAvailable: true,
+	}}})
+	tree.CompactRows = []core.CompactProcessRow{{
+		Label: "Codex agent host", ProcessCount: 1, PID: 42, ParentPID: 1, StartedAt: created,
+		Resources: core.ResourceUsage{CPUPercent: 7.5, MemoryBytes: 1572864, CPUAvailable: true, MemoryAvailable: true},
+	}}
+	tree.Session.Activities = []core.AgentActivity{{
+		ThreadID: "019f8390-4743-72a1-9df8-d780c4964fce", Workspace: `C:\Coding\taskwatch`,
+		Model: "gpt-5.6", LastTool: "exec", State: core.ActivityExecuting,
+		Correlation: core.CorrelationInferred, UpdatedAt: time.Date(2026, 7, 15, 3, 3, 5, 0, time.UTC),
+		ContextTokens: 82069, ContextWindow: 258400,
+	}}
+
+	for _, width := range []int{130, 60} {
+		t.Run(fmt.Sprintf("width_%d", width), func(t *testing.T) {
+			model := inspectionTestModel(width, 30, tree, nil, false)
+			model.now = func() time.Time { return time.Date(2026, 7, 15, 3, 4, 5, 0, time.UTC) }
+			plain := flattenRendered(model.View().Content)
+			for _, want := range []string{"AGENT ACTIVITY", "019f8390", "executing", "exec", "gpt-5.6", "31.8%", "1m", "inferred", `C:\Coding\taskwatch`, "PROCESS TREE", "Codex agent host"} {
+				if !strings.Contains(plain, want) {
+					t.Fatalf("width %d missing %q:\n%s", width, want, model.View().Content)
+				}
+			}
+			if strings.Contains(plain, "secret prompt") {
+				t.Fatalf("width %d rendered command line:\n%s", width, model.View().Content)
+			}
+			assertWithinWidth(t, model.View().Content, width)
+		})
+	}
+
+	model := inspectionTestModel(130, 30, tree, nil, false)
+	model.inspectionRaw = true
+	plain := flattenRendered(model.View().Content)
+	for _, want := range []string{"AGENT ACTIVITY", "019f8390", "PROCESS TREE", "codex.exe"} {
+		if !strings.Contains(plain, want) {
+			t.Fatalf("raw activity inspection missing %q:\n%s", want, model.View().Content)
+		}
+	}
+}
+
+func TestActivityRowNeverRendersProcessResourceFields(t *testing.T) {
+	activity := core.AgentActivity{
+		ThreadID: "thread", State: core.ActivityThinking, LastTool: "pytest", Model: "gpt-5.6",
+		Correlation: core.CorrelationDirect, ContextTokens: 50, ContextWindow: 100,
+	}
+	model := testModel(130, nil)
+	for _, width := range []int{130, 60} {
+		plain := flattenRendered(strings.Join(model.renderInspectionActivity(activity, width), "\n"))
+		for _, forbidden := range []string{"PID", "CPU", "MEMORY", "procs"} {
+			if strings.Contains(plain, forbidden) {
+				t.Fatalf("activity width %d contains process field %q: %s", width, forbidden, plain)
+			}
 		}
 	}
 }

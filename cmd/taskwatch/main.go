@@ -9,6 +9,7 @@ import (
 	tea "charm.land/bubbletea/v2"
 
 	"github.com/PyromancerBoom/taskwatch/internal/app"
+	codexcollector "github.com/PyromancerBoom/taskwatch/internal/collector/codex"
 	"github.com/PyromancerBoom/taskwatch/internal/platform/windows"
 	"github.com/PyromancerBoom/taskwatch/internal/tui"
 )
@@ -25,7 +26,7 @@ Start a tracked CLI session:
   3. Choose a recent workspace or enter a folder.
 
 Only sessions launched this way are supervised.
-Already-running CLI sessions are not discovered.
+Already-running Codex CLI sessions are observed read-only.
 The selected CLI must be available on PATH.
 
 Restart recovery remains available while the supervised session has running processes.
@@ -74,7 +75,12 @@ func run() error {
 	store := app.NewFileStore(paths.statePath)
 	supervisor := windows.NewSupervisor()
 	observer := windows.NewObserver(nil)
-	coordinator := app.NewCoordinator(paths.workspace, store, supervisor, observer, selfIdentity)
+	activityRoot, err := codexcollector.DefaultRoot()
+	if err != nil {
+		return fmt.Errorf("resolve Codex activity path: %w", err)
+	}
+	activityCollector := codexcollector.New(activityRoot)
+	coordinator := app.NewCoordinatorWithActivity(paths.workspace, store, supervisor, observer, activityCollector, selfIdentity)
 	defer coordinator.Close()
 
 	model := tui.NewModel(coordinator, tui.DefaultRefreshInterval)

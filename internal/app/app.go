@@ -36,6 +36,10 @@ type Observer interface {
 	Observe(map[uint32]core.ProcessIdentity) ([]core.Session, error)
 }
 
+type ActivityCollector interface {
+	Collect(time.Time) ([]core.AgentActivity, error)
+}
+
 type warningKind uint8
 
 const (
@@ -70,25 +74,35 @@ type ProcessTree struct {
 }
 
 type Coordinator struct {
-	mu               sync.Mutex
-	closed           bool
-	baseDir          string
-	store            SessionStore
-	supervisor       Supervisor
-	observer         Observer
-	selfIdentity     core.ProcessIdentity
-	now              func() time.Time
-	resolveWorkspace func(string, string) (string, error)
-	supervised       []core.Session
-	observed         []core.Session
-	recentWorkspaces []string
-	warnings         []Warning
-	refreshed        time.Time
-	persistenceDirty bool
+	mu                sync.Mutex
+	closed            bool
+	baseDir           string
+	store             SessionStore
+	supervisor        Supervisor
+	observer          Observer
+	activityCollector ActivityCollector
+	selfIdentity      core.ProcessIdentity
+	now               func() time.Time
+	resolveWorkspace  func(string, string) (string, error)
+	supervised        []core.Session
+	observed          []core.Session
+	recentWorkspaces  []string
+	warnings          []Warning
+	refreshed         time.Time
+	persistenceDirty  bool
+	activityMatches   map[string]activityMatch
+}
+
+type activityMatch struct {
+	Root      core.ProcessIdentity
+	ThreadID  string
+	Workspace string
 }
 
 // maxRecentWorkspaces caps the persisted recent-workspaces list.
 const maxRecentWorkspaces = 8
+
+const activityVisibilityWindow = 15 * time.Minute
 
 func NewCoordinator(baseDir string, store SessionStore, supervisor Supervisor, observer Observer, selfIdentity core.ProcessIdentity) *Coordinator {
 	coordinator := newCoordinator(baseDir, store, supervisor, observer, time.Now)
@@ -96,14 +110,26 @@ func NewCoordinator(baseDir string, store SessionStore, supervisor Supervisor, o
 	return coordinator
 }
 
+func NewCoordinatorWithActivity(baseDir string, store SessionStore, supervisor Supervisor, observer Observer, collector ActivityCollector, selfIdentity core.ProcessIdentity) *Coordinator {
+	coordinator := newCoordinatorWithActivity(baseDir, store, supervisor, observer, collector, time.Now)
+	coordinator.selfIdentity = selfIdentity
+	return coordinator
+}
+
 func newCoordinator(baseDir string, store SessionStore, supervisor Supervisor, observer Observer, now func() time.Time) *Coordinator {
+	return newCoordinatorWithActivity(baseDir, store, supervisor, observer, nil, now)
+}
+
+func newCoordinatorWithActivity(baseDir string, store SessionStore, supervisor Supervisor, observer Observer, collector ActivityCollector, now func() time.Time) *Coordinator {
 	return &Coordinator{
-		baseDir:          baseDir,
-		store:            store,
-		supervisor:       supervisor,
-		observer:         observer,
-		now:              now,
-		resolveWorkspace: resolveWorkspace,
+		baseDir:           baseDir,
+		store:             store,
+		supervisor:        supervisor,
+		observer:          observer,
+		activityCollector: collector,
+		now:               now,
+		resolveWorkspace:  resolveWorkspace,
+		activityMatches:   make(map[string]activityMatch),
 	}
 }
 
@@ -225,6 +251,7 @@ func (coordinator *Coordinator) Start() (Snapshot, error) {
 	coordinator.supervised = nil
 	coordinator.observed = nil
 	coordinator.warnings = nil
+	clear(coordinator.activityMatches)
 
 	recent, recentErr := coordinator.store.LoadRecentWorkspaces()
 	if recentErr != nil {
@@ -258,17 +285,20 @@ func (coordinator *Coordinator) Start() (Snapshot, error) {
 
 	observed, observeErr := coordinator.observer.Observe(coordinator.exclusions())
 	if observeErr != nil {
-		coordinator.warnings = append(coordinator.warnings, Warning{Message: fmt.Sprintf("observe desktop sessions: %v", observeErr)})
+		coordinator.warnings = append(coordinator.warnings, Warning{Message: fmt.Sprintf("observe Codex sessions: %v", observeErr)})
 	} else {
 		coordinator.observed = cloneSessions(observed)
 	}
+
+	refreshedAt := coordinator.now()
+	coordinator.collectActivities(refreshedAt)
 
 	if exited {
 		if err := coordinator.store.Save(cloneSessions(coordinator.persistedSessions())); err != nil {
 			return Snapshot{}, fmt.Errorf("save reconciled sessions: %w", err)
 		}
 	}
-	coordinator.refreshed = coordinator.now()
+	coordinator.refreshed = refreshedAt
 	return coordinator.snapshot(), nil
 }
 
@@ -325,10 +355,12 @@ func (coordinator *Coordinator) Refresh() Snapshot {
 			retained[i].State = core.StateStale
 		}
 		coordinator.observed = retained
-		coordinator.warnings = append(coordinator.warnings, Warning{Message: fmt.Sprintf("observe desktop sessions: %v", observeErr)})
+		coordinator.warnings = append(coordinator.warnings, Warning{Message: fmt.Sprintf("observe Codex sessions: %v", observeErr)})
 	} else {
 		coordinator.observed = cloneSessions(observed)
 	}
+	refreshedAt := coordinator.now()
+	coordinator.collectActivities(refreshedAt)
 
 	if newlyExited || coordinator.persistenceDirty {
 		if err := coordinator.store.Save(cloneSessions(coordinator.persistedSessions())); err != nil {
@@ -338,7 +370,7 @@ func (coordinator *Coordinator) Refresh() Snapshot {
 			coordinator.persistenceDirty = false
 		}
 	}
-	coordinator.refreshed = coordinator.now()
+	coordinator.refreshed = refreshedAt
 	return coordinator.snapshot()
 }
 
@@ -445,5 +477,201 @@ func cloneSessions(sessions []core.Session) []core.Session {
 func cloneSession(session core.Session) core.Session {
 	cloned := session
 	cloned.Processes = append([]core.Process(nil), session.Processes...)
+	cloned.Activities = append([]core.AgentActivity(nil), session.Activities...)
 	return cloned
+}
+
+func (coordinator *Coordinator) collectActivities(now time.Time) {
+	if coordinator.activityCollector == nil {
+		return
+	}
+	activities, err := coordinator.activityCollector.Collect(now)
+	if err != nil {
+		coordinator.warnings = append(coordinator.warnings, Warning{Message: "collect Codex activity: " + err.Error()})
+	}
+	visible := make([]core.AgentActivity, 0, len(activities))
+	for _, activity := range activities {
+		if activity.UpdatedAt.IsZero() || now.Sub(activity.UpdatedAt) > activityVisibilityWindow {
+			continue
+		}
+		visible = append(visible, activity)
+	}
+	coordinator.attachActivities(visible)
+}
+
+func (coordinator *Coordinator) attachActivities(activities []core.AgentActivity) {
+	for i := range coordinator.supervised {
+		coordinator.supervised[i].Activities = nil
+	}
+	for i := range coordinator.observed {
+		coordinator.observed[i].Activities = nil
+	}
+
+	var desktop []*core.Session
+	for i := range coordinator.observed {
+		session := &coordinator.observed[i]
+		if session.Tool == core.ToolCodexDesktop {
+			desktop = append(desktop, session)
+		}
+	}
+	if len(desktop) == 1 {
+		for _, activity := range activities {
+			if activity.Tool != core.ToolCodexDesktop {
+				continue
+			}
+			activity.Correlation = core.CorrelationApplication
+			desktop[0].Activities = append(desktop[0].Activities, activity)
+		}
+	}
+
+	cli := coordinator.runningCLISessions()
+	activeIDs := make(map[string]struct{}, len(cli))
+	for _, session := range cli {
+		activeIDs[session.ID] = struct{}{}
+	}
+	for id := range coordinator.activityMatches {
+		if _, active := activeIDs[id]; !active {
+			delete(coordinator.activityMatches, id)
+		}
+	}
+	available := make(map[string]core.AgentActivity)
+	for _, activity := range activities {
+		if activity.Tool == core.ToolCodexCLI && activity.ThreadID != "" {
+			available[strings.ToLower(activity.ThreadID)] = activity
+		}
+	}
+	assigned := make(map[string]struct{})
+	matched := make(map[string]struct{})
+	assign := func(session *core.Session, activity core.AgentActivity, correlation core.ActivityCorrelation) {
+		activity.Correlation = correlation
+		session.Activities = []core.AgentActivity{activity}
+		key := strings.ToLower(activity.ThreadID)
+		assigned[key] = struct{}{}
+		matched[session.ID] = struct{}{}
+		coordinator.activityMatches[session.ID] = activityMatch{Root: session.Root, ThreadID: activity.ThreadID, Workspace: activity.Workspace}
+	}
+
+	for _, session := range cli {
+		hint := strings.ToLower(session.ActivityMatchHint.ThreadID)
+		if hint == "" {
+			continue
+		}
+		if activity, exists := available[hint]; exists {
+			if _, used := assigned[hint]; !used {
+				assign(session, activity, core.CorrelationDirect)
+			}
+		}
+	}
+
+	for _, session := range cli {
+		if _, done := matched[session.ID]; done || session.ActivityMatchHint.ThreadID != "" {
+			continue
+		}
+		previous, sticky := coordinator.activityMatches[session.ID]
+		if sticky && !core.SameProcess(previous.Root, session.Root) {
+			sticky = false
+			delete(coordinator.activityMatches, session.ID)
+		}
+		workspace := firstWorkspace(session.Workspace, session.ActivityMatchHint.Workspace)
+		if workspace == "" && sticky {
+			workspace = previous.Workspace
+		}
+		if workspace != "" {
+			if activity, ok := bestWorkspaceActivity(available, assigned, workspace, session.StartedAt, sticky); ok {
+				assign(session, activity, core.CorrelationInferred)
+				continue
+			}
+		}
+		if sticky {
+			key := strings.ToLower(previous.ThreadID)
+			if activity, exists := available[key]; exists {
+				if _, used := assigned[key]; !used {
+					assign(session, activity, core.CorrelationInferred)
+				}
+			}
+		}
+	}
+
+	for _, session := range cli {
+		if _, done := matched[session.ID]; done || session.ActivityMatchHint.ThreadID != "" {
+			continue
+		}
+		if activity, ok := nearestActivity(available, assigned, session.StartedAt, time.Minute); ok {
+			assign(session, activity, core.CorrelationInferred)
+		}
+	}
+}
+
+func (coordinator *Coordinator) runningCLISessions() []*core.Session {
+	sessions := make([]*core.Session, 0)
+	for i := range coordinator.supervised {
+		if coordinator.supervised[i].Tool == core.ToolCodexCLI && coordinator.supervised[i].State == core.StateRunning {
+			sessions = append(sessions, &coordinator.supervised[i])
+		}
+	}
+	for i := range coordinator.observed {
+		if coordinator.observed[i].Tool == core.ToolCodexCLI && coordinator.observed[i].State == core.StateRunning {
+			sessions = append(sessions, &coordinator.observed[i])
+		}
+	}
+	sort.Slice(sessions, func(i, j int) bool {
+		if sessions[i].StartedAt.Equal(sessions[j].StartedAt) {
+			return sessions[i].ID < sessions[j].ID
+		}
+		return sessions[i].StartedAt.Before(sessions[j].StartedAt)
+	})
+	return sessions
+}
+
+func firstWorkspace(values ...string) string {
+	for _, value := range values {
+		if strings.TrimSpace(value) != "" {
+			return filepath.Clean(value)
+		}
+	}
+	return ""
+}
+
+func sameWorkspace(left, right string) bool {
+	return left != "" && right != "" && strings.EqualFold(filepath.Clean(left), filepath.Clean(right))
+}
+
+func bestWorkspaceActivity(activities map[string]core.AgentActivity, assigned map[string]struct{}, workspace string, started time.Time, preferNewest bool) (core.AgentActivity, bool) {
+	var best core.AgentActivity
+	found := false
+	for key, activity := range activities {
+		if _, used := assigned[key]; used || !sameWorkspace(activity.Workspace, workspace) {
+			continue
+		}
+		if !found || (preferNewest && activity.UpdatedAt.After(best.UpdatedAt)) || (!preferNewest && activityDistance(activity, started) < activityDistance(best, started)) {
+			best, found = activity, true
+		}
+	}
+	return best, found
+}
+
+func nearestActivity(activities map[string]core.AgentActivity, assigned map[string]struct{}, started time.Time, limit time.Duration) (core.AgentActivity, bool) {
+	var best core.AgentActivity
+	found := false
+	for key, activity := range activities {
+		if _, used := assigned[key]; used || activity.StartedAt.IsZero() {
+			continue
+		}
+		distance := activityDistance(activity, started)
+		if distance > limit {
+			continue
+		}
+		if !found || distance < activityDistance(best, started) || (distance == activityDistance(best, started) && activity.ThreadID < best.ThreadID) {
+			best, found = activity, true
+		}
+	}
+	return best, found
+}
+
+func activityDistance(activity core.AgentActivity, started time.Time) time.Duration {
+	distance := activity.StartedAt.Sub(started)
+	if distance < 0 {
+		return -distance
+	}
+	return distance
 }

@@ -32,7 +32,7 @@ func TestExecuteShowsHelpWithoutStartingTaskWatch(t *testing.T) {
   3. Choose a recent workspace or enter a folder.
 
 Only sessions launched this way are supervised.
-Already-running CLI sessions are not discovered.
+Already-running Codex CLI sessions are observed read-only.
 The selected CLI must be available on PATH.`
 	if !strings.Contains(stdout.String(), wantQuickStart) {
 		t.Errorf("help missing launch instructions:\n%s", stdout.String())

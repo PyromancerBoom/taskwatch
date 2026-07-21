@@ -615,6 +615,18 @@ func (m *Model) applyInspectionResult(tree app.ProcessTree, err error, refreshin
 }
 
 func (m Model) inspectionPageSize() int {
+	if m.hasInspectionActivities() {
+		total := len(m.inspectionCombinedLines(m.width))
+		start := min(max(m.inspectionScrollOffset, 0), total)
+		size := m.inspectionRowViewportLineCount()
+		if start > 0 {
+			size--
+		}
+		if total-start > size {
+			size--
+		}
+		return max(1, min(size, total-start))
+	}
 	start, end, _, _ := sessionWindow(
 		m.inspectionRowCount(), m.inspectionScrollOffset,
 		m.inspectionRowViewportLineCount(), inspectionRowsPerProcess(m.width),
@@ -631,6 +643,13 @@ func (m *Model) moveInspectionScroll(delta int) {
 }
 
 func (m *Model) clampInspectionScrollOffset() {
+	if m.hasInspectionActivities() {
+		total := len(m.inspectionCombinedLines(m.width))
+		viewport := m.inspectionRowViewportLineCount()
+		maxOffset := max(0, total-max(1, viewport-1))
+		m.inspectionScrollOffset = min(max(m.inspectionScrollOffset, 0), maxOffset)
+		return
+	}
 	total := m.inspectionRowCount()
 	if total == 0 {
 		m.inspectionScrollOffset = 0
@@ -654,6 +673,9 @@ func (m *Model) clampInspectionScrollOffset() {
 }
 
 func (m Model) inspectionRowCount() int {
+	if m.hasInspectionActivities() {
+		return len(m.inspectionCombinedLines(m.width))
+	}
 	if !m.inspectionRaw && m.inspectionTree.CompactRows != nil {
 		return len(m.inspectionTree.CompactRows)
 	}
@@ -704,7 +726,7 @@ func (m Model) inspectionViewportLineCount() int {
 	}
 	headerLines := len(truncateHeaderLines(m.headerLines(width), height))
 	fixedLines := headerLines + 2 + 1 // context + footer
-	if width >= 110 {
+	if width >= 110 && !m.hasInspectionActivities() {
 		fixedLines++
 	}
 	viewport := height - fixedLines
@@ -780,8 +802,8 @@ func (m Model) layoutPlanForViewport() layoutPlan {
 	headingEligible := width >= 80
 
 	detailLines := 0
-	if _, hasSelection := m.selectedSession(); hasSelection {
-		detailLines = detailPanelLineCount()
+	if selected, hasSelection := m.selectedSession(); hasSelection {
+		detailLines = detailPanelLineCountFor(selected)
 	}
 	return planLayout(width, height, headerLines, len(m.snapshot.Warnings) > 0, headingEligible, hasSessions, detailLines)
 }

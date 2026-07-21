@@ -1378,6 +1378,57 @@ func TestInspectionToggleIsBlockedWhileLoadingAndNewInspectionResetsCompactMode(
 	}
 }
 
+func TestActivityInspectionUsesCombinedViewportAndPreservesModeAcrossRefresh(t *testing.T) {
+	now := time.Date(2026, 7, 21, 12, 0, 0, 0, time.UTC)
+	sessionWithActivity := session("one")
+	for i := 0; i < 4; i++ {
+		sessionWithActivity.Activities = append(sessionWithActivity.Activities, core.AgentActivity{
+			ThreadID: fmt.Sprintf("thread-%d", i), State: core.ActivityThinking, UpdatedAt: now.Add(time.Duration(i) * time.Second),
+		})
+	}
+	raw := make([]core.ProcessTreeRow, 12)
+	compact := make([]core.CompactProcessRow, 6)
+	model := NewModel(&stubCoordinator{}, time.Second)
+	model.started = true
+	model.width = 80
+	model.height = 12
+	model.screen = screenInspection
+	model.inspectionSessionID = "one"
+	model.inspectionTree = app.ProcessTree{Session: sessionWithActivity, Rows: raw, CompactRows: compact}
+
+	combined := model.inspectionRowCount()
+	if combined <= len(compact) {
+		t.Fatalf("combined row count = %d, want activity and section lines in addition to %d processes", combined, len(compact))
+	}
+	viewport := model.inspectionRowViewportLineCount()
+	firstPage := model.inspectionPageSize()
+	if firstPage != viewport-1 {
+		t.Fatalf("first page size = %d, viewport = %d; want one line reserved for below indicator", firstPage, viewport)
+	}
+	model, _ = update(t, model, key("pgdown"))
+	if model.inspectionScrollOffset != firstPage {
+		t.Fatalf("page-down offset = %d, want next undisplayed content line %d", model.inspectionScrollOffset, firstPage)
+	}
+	if remaining := combined - model.inspectionScrollOffset; remaining > viewport-1 && model.inspectionPageSize() != viewport-2 {
+		t.Fatalf("middle page size = %d, viewport = %d; want room for above and below indicators", model.inspectionPageSize(), viewport)
+	}
+	model, _ = update(t, model, key("t"))
+	if !model.inspectionRaw || model.inspectionScrollOffset != 0 {
+		t.Fatalf("toggle raw=%v offset=%d, want raw at top", model.inspectionRaw, model.inspectionScrollOffset)
+	}
+
+	model.inspectionScrollOffset = 100
+	refreshedSession := session("one")
+	refreshedSession.Activities = []core.AgentActivity{{ThreadID: "fresh", State: core.ActivityWaiting, UpdatedAt: now}}
+	model.applyInspectionResult(app.ProcessTree{Session: refreshedSession, Rows: raw[:1], CompactRows: compact[:1]}, nil, true)
+	if !model.inspectionRaw {
+		t.Fatal("refresh reset the selected raw projection")
+	}
+	if model.inspectionScrollOffset >= model.inspectionRowCount() {
+		t.Fatalf("refresh offset = %d, rows = %d; want clamped", model.inspectionScrollOffset, model.inspectionRowCount())
+	}
+}
+
 func TestInspectionRefreshesSnapshotThenSameSessionTreeAtomically(t *testing.T) {
 	for _, trigger := range []string{"automatic", "manual"} {
 		t.Run(trigger, func(t *testing.T) {

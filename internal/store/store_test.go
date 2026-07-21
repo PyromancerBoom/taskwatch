@@ -23,6 +23,10 @@ func TestSaveAndLoadRoundTripSupervisedSessionsOnly(t *testing.T) {
 			Workspace:  `C:\work\taskwatch`,
 			Root:       core.ProcessIdentity{PID: 42, CreatedAt: rootCreated},
 			StartedAt:  started,
+			Activities: []core.AgentActivity{{
+				ThreadID: "ephemeral-thread", Workspace: `C:\secret-activity-workspace`, Model: "ephemeral-model",
+			}},
+			ActivityMatchHint: core.ActivityMatchHint{ThreadID: "ephemeral-hint", Workspace: `C:\secret-hint-workspace`},
 		},
 		{
 			ID:         "observed-1",
@@ -52,6 +56,9 @@ func TestSaveAndLoadRoundTripSupervisedSessionsOnly(t *testing.T) {
 	if got[0].Root.PID != 42 || !got[0].Root.CreatedAt.Equal(rootCreated) || !got[0].StartedAt.Equal(started) {
 		t.Fatalf("Load() identity/times = %#v, want PID 42 created at %v and session started at %v", got[0], rootCreated, started)
 	}
+	if len(got[0].Activities) != 0 || got[0].ActivityMatchHint != (core.ActivityMatchHint{}) {
+		t.Fatalf("Load() restored ephemeral activity data: %#v", got[0])
+	}
 	raw, err := os.ReadFile(path)
 	if err != nil {
 		t.Fatalf("ReadFile() error = %v", err)
@@ -61,6 +68,11 @@ func TestSaveAndLoadRoundTripSupervisedSessionsOnly(t *testing.T) {
 	}
 	if strings.Contains(string(raw), "observed-1") {
 		t.Fatalf("saved JSON contains observed session: %s", raw)
+	}
+	for _, secret := range []string{"ephemeral-thread", "ephemeral-model", "secret-activity-workspace", "ephemeral-hint", "secret-hint-workspace"} {
+		if strings.Contains(string(raw), secret) {
+			t.Fatalf("saved JSON contains ephemeral activity value %q: %s", secret, raw)
+		}
 	}
 	if matches, err := filepath.Glob(filepath.Join(filepath.Dir(path), ".sessions.json.tmp-*")); err != nil || len(matches) != 0 {
 		t.Fatalf("temporary save files = %v, error = %v", matches, err)
