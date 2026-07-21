@@ -4,7 +4,9 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -21,6 +23,7 @@ const (
 	processTerminateAccess      = 0x0001
 	observedTerminationExitCode = 1
 	launchCleanupExitCode       = 1
+	jobKeeperHandleEnv          = "TASKWATCH_JOB_KEEPER_HANDLE"
 )
 
 var (
@@ -124,21 +127,69 @@ func (nativeWindows) assignProcess(job, process nativeHandle) error {
 	return winapi.AssignProcessToJobObject(winapi.Handle(job), winapi.Handle(process))
 }
 
-// duplicateJobHandleIntoProcess gives the suspended root a non-inheritable
-// handle to its own named job. That keeps the kernel object open if TaskWatch
-// exits, allowing a restarted TaskWatch to reopen it while the root still
-// lives. The remote handle closes automatically when the root exits.
-func (nativeWindows) duplicateJobHandleIntoProcess(job, process nativeHandle) error {
-	var remoteHandle winapi.Handle
-	return winapi.DuplicateHandle(
+func (nativeWindows) startJobKeeper(job nativeHandle) error {
+	keeperHandle, err := duplicateJobKeeperHandle(job)
+	if err != nil {
+		return err
+	}
+	defer winapi.CloseHandle(winapi.Handle(keeperHandle))
+
+	executable, err := os.Executable()
+	if err != nil {
+		return err
+	}
+	command := exec.Command(executable)
+	command.Env = append(os.Environ(), jobKeeperHandleEnv+"="+strconv.FormatUint(uint64(keeperHandle), 10))
+	command.SysProcAttr = &syscall.SysProcAttr{
+		HideWindow:                 true,
+		CreationFlags:              winapi.CREATE_NO_WINDOW,
+		AdditionalInheritedHandles: []syscall.Handle{syscall.Handle(keeperHandle)},
+	}
+	if err := command.Start(); err != nil {
+		return err
+	}
+	return command.Process.Release()
+}
+
+func duplicateJobKeeperHandle(job nativeHandle) (nativeHandle, error) {
+	var keeperHandle winapi.Handle
+	if err := winapi.DuplicateHandle(
 		winapi.CurrentProcess(),
 		winapi.Handle(job),
-		winapi.Handle(process),
-		&remoteHandle,
+		winapi.CurrentProcess(),
+		&keeperHandle,
+		jobObjectQuery,
+		true,
 		0,
-		false,
-		winapi.DUPLICATE_SAME_ACCESS,
-	)
+	); err != nil {
+		return 0, err
+	}
+	return nativeHandle(keeperHandle), nil
+}
+
+// RunJobKeeperIfRequested keeps the internal keeper process alive until every
+// process assigned to its Job Object has exited.
+func RunJobKeeperIfRequested() (bool, error) {
+	value, requested := os.LookupEnv(jobKeeperHandleEnv)
+	if !requested {
+		return false, nil
+	}
+	rawHandle, err := strconv.ParseUint(value, 10, 64)
+	if err != nil || rawHandle == 0 {
+		return true, fmt.Errorf("invalid job keeper handle")
+	}
+	handle := winapi.Handle(rawHandle)
+	defer winapi.CloseHandle(handle)
+	for {
+		pids, err := (nativeWindows{}).jobProcessIDs(nativeHandle(handle))
+		if err != nil {
+			return true, err
+		}
+		if len(pids) == 0 {
+			return true, nil
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
 }
 
 func (nativeWindows) resumeThread(thread nativeHandle) error {

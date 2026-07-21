@@ -74,6 +74,34 @@ func TestGroupCodexDesktopMarksMetadataFailuresInaccessibleAndOmitsIdentitylessD
 	}
 }
 
+func TestGroupCodexDesktopKeepsIdentitySafeTreeRunningWhenOptionalMetadataFails(t *testing.T) {
+	created := time.Unix(100, 0).UTC()
+	processes := []ProcessDetails{
+		{
+			Process:            core.Process{PID: 10, ParentPID: 1, Name: "Codex.exe", CreatedAt: created},
+			ExecutablePath:     packagedCodexDesktopPath,
+			MetadataAccessible: true,
+			MetadataError:      "command line: access denied; memory: access denied",
+		},
+		{
+			Process:            core.Process{PID: 11, ParentPID: 10, Name: "renderer.exe", CreatedAt: created.Add(time.Second)},
+			MetadataAccessible: true,
+			MetadataError:      "path: access denied",
+		},
+	}
+
+	got := GroupCodexDesktop(processes, nil)
+	if len(got) != 1 {
+		t.Fatalf("GroupCodexDesktop() returned %d sessions, want 1", len(got))
+	}
+	if got[0].State != core.StateRunning {
+		t.Fatalf("session state = %q, want running", got[0].State)
+	}
+	if len(got[0].Processes) != 2 {
+		t.Fatalf("processes = %#v, want complete identity-safe tree", got[0].Processes)
+	}
+}
+
 func TestGroupCodexDesktopDoesNotSuppressOlderRootBehindReusedNewerParentPID(t *testing.T) {
 	older := time.Unix(100, 0).UTC()
 	newer := older.Add(time.Hour)

@@ -91,7 +91,7 @@ func observedTreeInaccessible(rootPID uint32, detailsByPID map[uint32]ProcessDet
 		if !exists {
 			continue
 		}
-		if !detail.MetadataAccessible || detail.MetadataError != "" || detail.Process.CreatedAt.IsZero() {
+		if !detail.MetadataAccessible || detail.Process.CreatedAt.IsZero() {
 			return true
 		}
 		if _, validated := safe[pid]; !validated {

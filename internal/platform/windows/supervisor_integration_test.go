@@ -1,6 +1,7 @@
 package windows
 
 import (
+	"errors"
 	"io"
 	"os"
 	"os/exec"
@@ -8,6 +9,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
@@ -23,6 +25,17 @@ const (
 )
 
 func TestMain(m *testing.M) {
+	if _, keeper := os.LookupEnv(jobKeeperHandleEnv); keeper {
+		if directory := os.Getenv(jobHelperDirEnv); directory != "" {
+			_ = os.WriteFile(filepath.Join(directory, "keeper.pid"), []byte(strconv.Itoa(os.Getpid())), 0o600)
+		}
+	}
+	if requested, err := RunJobKeeperIfRequested(); requested {
+		if err != nil {
+			os.Exit(8)
+		}
+		os.Exit(0)
+	}
 	if role := os.Getenv(jobHelperRoleEnv); role != "" {
 		os.Exit(runJobHelper(role, os.Getenv(jobHelperDirEnv)))
 	}
@@ -32,9 +45,10 @@ func TestMain(m *testing.M) {
 // TestSupervisorRealJobLifecycle proves the Windows behavior that the fake
 // native tests cannot: descendants inherit the real Job Object, closing
 // TaskWatch's handle leaves them alive, and a fresh Supervisor can recover the
-// named job while the root-held handle still exists. After recovery, the fresh
-// Supervisor keeps the job available when the root exits and descendants are
-// left over. Helpers stop cooperatively; this test never terminates a process.
+// named job while a trusted query-only keeper holds it open outside the job.
+// After recovery, the fresh Supervisor keeps the job available when the root
+// exits and descendants are left over. Helpers stop cooperatively; this test
+// never terminates a process.
 func TestSupervisorRealJobLifecycle(t *testing.T) {
 	helperDir := t.TempDir()
 	launched := false
@@ -65,6 +79,7 @@ func TestSupervisorRealJobLifecycle(t *testing.T) {
 	}
 	launched = true
 	pids := waitForHelperPIDs(t, helperDir)
+	keeperPID := waitForPIDFile(t, filepath.Join(helperDir, "keeper.pid"))
 	if pids[jobHelperRoot] != session.Root.PID {
 		t.Fatalf("root PID file = %d, session root = %d", pids[jobHelperRoot], session.Root.PID)
 	}
@@ -75,6 +90,9 @@ func TestSupervisorRealJobLifecycle(t *testing.T) {
 	}, func(got core.Session) bool {
 		return got.State == core.StateRunning && containsAllPIDs(sessionPIDs(got), wantAll)
 	})
+	if containsPID(sessionPIDs(running), keeperPID) {
+		t.Fatalf("trusted keeper PID %d is a member of supervised job %v", keeperPID, sessionPIDs(running))
+	}
 	if running.Confidence != core.ConfidenceSupervised {
 		t.Fatalf("running confidence = %q, want supervised", running.Confidence)
 	}
@@ -87,7 +105,7 @@ func TestSupervisorRealJobLifecycle(t *testing.T) {
 	if err != nil {
 		t.Fatalf("recover named job after closing original supervisor: %v", err)
 	}
-	if recovered.State != core.StateRunning || !containsAllPIDs(sessionPIDs(recovered), wantAll) {
+	if recoveredPIDs := sessionPIDs(recovered); recovered.State != core.StateRunning || !containsAllPIDs(recoveredPIDs, wantAll) || containsPID(recoveredPIDs, keeperPID) {
 		t.Fatalf("recovered session = state %q PIDs %v, want running with helpers %v", recovered.State, sessionPIDs(recovered), wantAll)
 	}
 
@@ -97,7 +115,7 @@ func TestSupervisorRealJobLifecycle(t *testing.T) {
 		return second.Refresh(recovered)
 	}, func(got core.Session) bool {
 		gotPIDs := sessionPIDs(got)
-		return got.State == core.StateLeftovers && !containsPID(gotPIDs, pids[jobHelperRoot]) && containsAllPIDs(gotPIDs, wantLeftovers)
+		return got.State == core.StateLeftovers && !containsPID(gotPIDs, keeperPID) && containsAllPIDs(gotPIDs, wantLeftovers)
 	})
 	if leftovers.Root != session.Root {
 		t.Fatalf("leftover root identity changed: got %#v, want %#v", leftovers.Root, session.Root)
@@ -110,6 +128,8 @@ func TestSupervisorRealJobLifecycle(t *testing.T) {
 	}, func(got core.Session) bool {
 		return got.State == core.StateExited && len(got.Processes) == 0
 	})
+	second.Close()
+	waitForJobMissing(t, session.JobName)
 }
 
 func runJobHelper(role, directory string) int {
@@ -217,6 +237,41 @@ func waitForHelperPIDs(t *testing.T, directory string) map[string]uint32 {
 	}
 	t.Fatalf("helpers did not become ready: got %v", result)
 	return nil
+}
+
+func waitForPIDFile(t *testing.T, path string) uint32 {
+	t.Helper()
+	deadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) {
+		value, err := os.ReadFile(path)
+		if err == nil {
+			pid, parseErr := strconv.ParseUint(string(value), 10, 32)
+			if parseErr == nil && pid != 0 {
+				return uint32(pid)
+			}
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Fatalf("PID file %s did not become ready", path)
+	return 0
+}
+
+func waitForJobMissing(t *testing.T, name string) {
+	t.Helper()
+	native := nativeWindows{}
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		handle, err := native.openJob(name)
+		if errors.Is(err, syscall.ERROR_FILE_NOT_FOUND) {
+			return
+		}
+		if err != nil {
+			t.Fatalf("open job %q while waiting for cleanup: %v", name, err)
+		}
+		native.closeHandle(handle)
+		time.Sleep(25 * time.Millisecond)
+	}
+	t.Fatalf("job %q still exists after membership reached zero", name)
 }
 
 func waitForSession(t *testing.T, timeout time.Duration, refresh func() (core.Session, error), ready func(core.Session) bool) core.Session {

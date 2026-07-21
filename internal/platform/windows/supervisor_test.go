@@ -7,6 +7,7 @@ import (
 	"syscall"
 	"testing"
 	"time"
+	"unsafe"
 
 	winapi "golang.org/x/sys/windows"
 
@@ -30,7 +31,7 @@ func (resolver *fakeResolver) LookPath(name string) (string, error) {
 type fakeNative struct {
 	events             []string
 	failAssign         bool
-	failDuplicate      bool
+	failKeeper         bool
 	jobPIDs            []uint32
 	jobHandles         map[string]nativeHandle
 	openJobErrors      map[string]error
@@ -70,10 +71,10 @@ func (native *fakeNative) assignProcess(nativeHandle, nativeHandle) error {
 	}
 	return nil
 }
-func (native *fakeNative) duplicateJobHandleIntoProcess(nativeHandle, nativeHandle) error {
-	native.events = append(native.events, "duplicate-job-handle")
-	if native.failDuplicate {
-		return errors.New("duplicate failed")
+func (native *fakeNative) startJobKeeper(nativeHandle) error {
+	native.events = append(native.events, "start-job-keeper")
+	if native.failKeeper {
+		return errors.New("keeper failed")
 	}
 	return nil
 }
@@ -123,6 +124,15 @@ type fakeSnapshotter struct {
 	calls     int
 }
 
+func observedSession(id string, root core.Process) core.Session {
+	return core.Session{
+		ID:         id,
+		Tool:       core.ToolCodexDesktop,
+		Confidence: core.ConfidenceObserved,
+		Root:       root.Identity(),
+	}
+}
+
 func TestCurrentProcessIdentityMatchesSnapshot(t *testing.T) {
 	identity, err := CurrentProcessIdentity()
 	if err != nil {
@@ -144,12 +154,69 @@ func TestCurrentProcessIdentityMatchesSnapshot(t *testing.T) {
 	t.Fatalf("current PID %d missing from snapshot", identity.PID)
 }
 
+func TestJobKeeperHandleHasOnlyQueryAccess(t *testing.T) {
+	native := nativeWindows{}
+	job, err := native.createJob("")
+	if err != nil {
+		t.Fatalf("createJob() error = %v", err)
+	}
+	defer native.closeHandle(job)
+
+	keeper, err := duplicateJobKeeperHandle(job)
+	if err != nil {
+		t.Fatalf("duplicateJobKeeperHandle() error = %v", err)
+	}
+	defer native.closeHandle(keeper)
+	if _, err := native.jobProcessIDs(keeper); err != nil {
+		t.Fatalf("jobProcessIDs() error = %v, want query access", err)
+	}
+	if granted := grantedAccess(t, keeper); granted != jobObjectQuery {
+		t.Fatalf("keeper granted access = %#x, want query-only %#x", granted, jobObjectQuery)
+	}
+
+	limits := winapi.JOBOBJECT_BASIC_LIMIT_INFORMATION{}
+	_, err = winapi.SetInformationJobObject(
+		winapi.Handle(keeper),
+		winapi.JobObjectBasicLimitInformation,
+		uintptr(unsafe.Pointer(&limits)),
+		uint32(unsafe.Sizeof(limits)),
+	)
+	if !errors.Is(err, syscall.ERROR_ACCESS_DENIED) {
+		t.Fatalf("SetInformationJobObject() error = %v, want access denied", err)
+	}
+}
+
+func grantedAccess(t *testing.T, handle nativeHandle) uint32 {
+	t.Helper()
+	type objectBasicInformation struct {
+		Attributes    uint32
+		GrantedAccess uint32
+		HandleCount   uint32
+		PointerCount  uint32
+		Reserved      [10]uint32
+	}
+	information := objectBasicInformation{}
+	var returned uint32
+	procNtQueryObject := winapi.NewLazySystemDLL("ntdll.dll").NewProc("NtQueryObject")
+	status, _, _ := procNtQueryObject.Call(
+		uintptr(handle),
+		0,
+		uintptr(unsafe.Pointer(&information)),
+		unsafe.Sizeof(information),
+		uintptr(unsafe.Pointer(&returned)),
+	)
+	if int32(status) < 0 {
+		t.Fatalf("NtQueryObject() status = %#x", uint32(status))
+	}
+	return information.GrantedAccess
+}
+
 func (snapshotter *fakeSnapshotter) Snapshot() ([]ProcessDetails, error) {
 	snapshotter.calls++
 	return append([]ProcessDetails(nil), snapshotter.processes...), snapshotter.err
 }
 
-func TestLaunchResolvesOnlySupportedToolAndAssignsBeforeResume(t *testing.T) {
+func TestLaunchResolvesOnlySupportedToolAndStartsKeeperBeforeResume(t *testing.T) {
 	created := time.Unix(100, 0).UTC()
 	resolver := &fakeResolver{paths: map[string]string{"codex": `C:\tools\codex.exe`}}
 	native := &fakeNative{createdAt: created}
@@ -162,11 +229,8 @@ func TestLaunchResolvesOnlySupportedToolAndAssignsBeforeResume(t *testing.T) {
 	if !reflect.DeepEqual(resolver.looked, []string{"codex"}) {
 		t.Fatalf("resolver calls = %v, want [codex]", resolver.looked)
 	}
-	if index(native.events, "assign") > index(native.events, "resume") {
-		t.Fatalf("native events = %v, assignment must precede resume", native.events)
-	}
-	if index(native.events, "assign") > index(native.events, "duplicate-job-handle") || index(native.events, "duplicate-job-handle") > index(native.events, "resume") {
-		t.Fatalf("native events = %v, job handle must be retained after assignment and before resume", native.events)
+	if index(native.events, "assign") > index(native.events, "start-job-keeper") || index(native.events, "start-job-keeper") > index(native.events, "resume") {
+		t.Fatalf("native events = %v, assignment and keeper start must precede resume", native.events)
 	}
 	if session.Tool != core.ToolCodexCLI || session.Root.PID != 42 || !session.Root.CreatedAt.Equal(created) || session.Confidence != core.ConfidenceSupervised {
 		t.Fatalf("Launch() session = %#v", session)
@@ -186,13 +250,13 @@ func TestLaunchAssignmentFailureTerminatesSuspendedProcess(t *testing.T) {
 	}
 }
 
-func TestLaunchJobHandleDuplicationFailureTerminatesSuspendedProcess(t *testing.T) {
+func TestLaunchJobKeeperFailureTerminatesSuspendedProcess(t *testing.T) {
 	resolver := &fakeResolver{paths: map[string]string{"claude": `C:\tools\claude.exe`}}
-	native := &fakeNative{failDuplicate: true, createdAt: time.Unix(100, 0).UTC()}
+	native := &fakeNative{failKeeper: true, createdAt: time.Unix(100, 0).UTC()}
 	supervisor := newSupervisor(resolver, native, &fakeSnapshotter{})
 
 	if _, err := supervisor.Launch(core.ToolClaudeCLI, `C:\work`); err == nil {
-		t.Fatal("Launch() accepted failed job-handle duplication")
+		t.Fatal("Launch() accepted failed job keeper startup")
 	}
 	if index(native.events, "terminate-suspended") == -1 || index(native.events, "resume") != -1 {
 		t.Fatalf("native events = %v, want suspended process terminated and never resumed", native.events)
@@ -694,12 +758,32 @@ func TestRefreshTreatsUnreadableMatchedJobMemberAsInaccessible(t *testing.T) {
 	}
 }
 
+func TestRefreshKeepsIdentitySafeJobMembersAccessibleWhenOptionalMetadataFails(t *testing.T) {
+	created := time.Unix(100, 0).UTC()
+	snapshotter := &fakeSnapshotter{processes: []ProcessDetails{{
+		Process:            core.Process{PID: 42, ParentPID: 1, CreatedAt: created},
+		MetadataAccessible: true,
+		MetadataError:      "path: access denied; command line: access denied; memory: access denied",
+	}}}
+	native := &fakeNative{jobPIDs: []uint32{42}}
+	supervisor := newSupervisor(&fakeResolver{}, native, snapshotter)
+	session := core.Session{ID: "s1", Confidence: core.ConfidenceSupervised, JobName: "TaskWatch-test", Root: core.ProcessIdentity{PID: 42, CreatedAt: created}}
+
+	got, err := supervisor.Refresh(session)
+	if err != nil {
+		t.Fatalf("Refresh() error = %v", err)
+	}
+	if got.State != core.StateRunning {
+		t.Fatalf("Refresh() state = %q, want running", got.State)
+	}
+}
+
 func TestTerminateObservedPreflightsAllTargetsBeforeLeafFirstKill(t *testing.T) {
 	created := time.Unix(100, 0).UTC()
 	current := []ProcessDetails{
-		{Process: core.Process{PID: 10, ParentPID: 1, CreatedAt: created}},
-		{Process: core.Process{PID: 11, ParentPID: 10, CreatedAt: created.Add(time.Second)}},
-		{Process: core.Process{PID: 12, ParentPID: 11, CreatedAt: created.Add(2 * time.Second)}},
+		{Process: core.Process{PID: 10, ParentPID: 1, CreatedAt: created}, MetadataAccessible: true},
+		{Process: core.Process{PID: 11, ParentPID: 10, CreatedAt: created.Add(time.Second)}, MetadataAccessible: true},
+		{Process: core.Process{PID: 12, ParentPID: 11, CreatedAt: created.Add(2 * time.Second)}, MetadataAccessible: true},
 	}
 	native := &fakeNative{createdByPID: map[uint32]time.Time{
 		10: created,
@@ -709,7 +793,7 @@ func TestTerminateObservedPreflightsAllTargetsBeforeLeafFirstKill(t *testing.T) 
 	supervisor := newSupervisor(&fakeResolver{}, native, &fakeSnapshotter{processes: current})
 	request := core.NewTerminationRequest("observed-10", detailsProcesses(current)).Confirm()
 
-	if err := supervisor.TerminateObserved(request); err != nil {
+	if err := supervisor.TerminateObserved(request, observedSession("observed-10", current[0].Process)); err != nil {
 		t.Fatalf("TerminateObserved() error = %v", err)
 	}
 	if !reflect.DeepEqual(native.openedForTerminate, []uint32{10, 11, 12}) {
@@ -723,14 +807,14 @@ func TestTerminateObservedPreflightsAllTargetsBeforeLeafFirstKill(t *testing.T) 
 func TestTerminateObservedPreflightFailureKillsNothing(t *testing.T) {
 	created := time.Unix(100, 0).UTC()
 	current := []ProcessDetails{
-		{Process: core.Process{PID: 10, ParentPID: 1, CreatedAt: created}},
-		{Process: core.Process{PID: 11, ParentPID: 10, CreatedAt: created.Add(time.Second)}},
+		{Process: core.Process{PID: 10, ParentPID: 1, CreatedAt: created}, MetadataAccessible: true},
+		{Process: core.Process{PID: 11, ParentPID: 10, CreatedAt: created.Add(time.Second)}, MetadataAccessible: true},
 	}
 	native := &fakeNative{failOpenPID: 11, createdByPID: map[uint32]time.Time{10: created}}
 	supervisor := newSupervisor(&fakeResolver{}, native, &fakeSnapshotter{processes: current})
 	request := core.NewTerminationRequest("observed-10", detailsProcesses(current)).Confirm()
 
-	if err := supervisor.TerminateObserved(request); err == nil {
+	if err := supervisor.TerminateObserved(request, observedSession("observed-10", current[0].Process)); err == nil {
 		t.Fatal("TerminateObserved() accepted failed preflight")
 	}
 	if len(native.terminatedPIDs) != 0 {
@@ -741,8 +825,8 @@ func TestTerminateObservedPreflightFailureKillsNothing(t *testing.T) {
 func TestTerminateObservedReusedPIDDuringPreflightKillsNothing(t *testing.T) {
 	created := time.Unix(100, 0).UTC()
 	current := []ProcessDetails{
-		{Process: core.Process{PID: 10, ParentPID: 1, CreatedAt: created}},
-		{Process: core.Process{PID: 11, ParentPID: 10, CreatedAt: created.Add(time.Second)}},
+		{Process: core.Process{PID: 10, ParentPID: 1, CreatedAt: created}, MetadataAccessible: true},
+		{Process: core.Process{PID: 11, ParentPID: 10, CreatedAt: created.Add(time.Second)}, MetadataAccessible: true},
 	}
 	native := &fakeNative{createdByPID: map[uint32]time.Time{
 		10: created,
@@ -751,7 +835,7 @@ func TestTerminateObservedReusedPIDDuringPreflightKillsNothing(t *testing.T) {
 	supervisor := newSupervisor(&fakeResolver{}, native, &fakeSnapshotter{processes: current})
 	request := core.NewTerminationRequest("observed-10", detailsProcesses(current)).Confirm()
 
-	if err := supervisor.TerminateObserved(request); err == nil {
+	if err := supervisor.TerminateObserved(request, observedSession("observed-10", current[0].Process)); err == nil {
 		t.Fatal("TerminateObserved() accepted a PID reused after the snapshot")
 	}
 	if len(native.terminatedPIDs) != 0 {
@@ -762,8 +846,8 @@ func TestTerminateObservedReusedPIDDuringPreflightKillsNothing(t *testing.T) {
 func TestTerminateObservedDoesNotDependOnConfirmationOrder(t *testing.T) {
 	created := time.Unix(100, 0).UTC()
 	current := []ProcessDetails{
-		{Process: core.Process{PID: 10, ParentPID: 1, CreatedAt: created}},
-		{Process: core.Process{PID: 11, ParentPID: 10, CreatedAt: created.Add(time.Second)}},
+		{Process: core.Process{PID: 10, ParentPID: 1, CreatedAt: created}, MetadataAccessible: true},
+		{Process: core.Process{PID: 11, ParentPID: 10, CreatedAt: created.Add(time.Second)}, MetadataAccessible: true},
 	}
 	native := &fakeNative{createdByPID: map[uint32]time.Time{
 		10: created,
@@ -772,7 +856,7 @@ func TestTerminateObservedDoesNotDependOnConfirmationOrder(t *testing.T) {
 	supervisor := newSupervisor(&fakeResolver{}, native, &fakeSnapshotter{processes: current})
 	request := core.NewTerminationRequest("observed-10", []core.Process{current[1].Process, current[0].Process}).Confirm()
 
-	if err := supervisor.TerminateObserved(request); err != nil {
+	if err := supervisor.TerminateObserved(request, observedSession("observed-10", current[0].Process)); err != nil {
 		t.Fatalf("TerminateObserved() error for reordered confirmation = %v", err)
 	}
 	if !reflect.DeepEqual(native.terminatedPIDs, []uint32{11, 10}) {
@@ -790,11 +874,98 @@ func TestTerminateObservedRejectsFalseAncestryFromOlderChild(t *testing.T) {
 	supervisor := newSupervisor(&fakeResolver{}, native, &fakeSnapshotter{processes: current})
 	request := core.NewTerminationRequest("observed-10", detailsProcesses(current)).Confirm()
 
-	if err := supervisor.TerminateObserved(request); err == nil {
+	if err := supervisor.TerminateObserved(request, observedSession("observed-10", current[0].Process)); err == nil {
 		t.Fatal("TerminateObserved() accepted an older process as the root's descendant")
 	}
 	if len(native.openedForTerminate) != 0 || len(native.terminatedPIDs) != 0 {
 		t.Fatalf("opened/terminated = %v/%v, want zero", native.openedForTerminate, native.terminatedPIDs)
+	}
+}
+
+func TestTerminateObservedRejectsConfirmationForDifferentSession(t *testing.T) {
+	created := time.Unix(100, 0).UTC()
+	current := []ProcessDetails{{
+		Process:            core.Process{PID: 10, ParentPID: 1, CreatedAt: created},
+		MetadataAccessible: true,
+	}}
+	snapshotter := &fakeSnapshotter{processes: current}
+	native := &fakeNative{createdByPID: map[uint32]time.Time{10: created}}
+	supervisor := newSupervisor(&fakeResolver{}, native, snapshotter)
+	request := core.NewTerminationRequest("different-session", detailsProcesses(current)).Confirm()
+
+	if err := supervisor.TerminateObserved(request, observedSession("observed-10", current[0].Process)); err == nil {
+		t.Fatal("TerminateObserved() accepted confirmation for a different session")
+	}
+	if snapshotter.calls != 0 || len(native.openedForTerminate) != 0 || len(native.terminatedPIDs) != 0 {
+		t.Fatalf("snapshot/opened/terminated = %d/%v/%v, want no work", snapshotter.calls, native.openedForTerminate, native.terminatedPIDs)
+	}
+}
+
+func TestTerminateObservedRejectsFreshInaccessibleMetadata(t *testing.T) {
+	created := time.Unix(100, 0).UTC()
+	tests := []struct {
+		name   string
+		detail ProcessDetails
+	}{
+		{
+			name:   "unreadable process",
+			detail: ProcessDetails{Process: core.Process{PID: 10, ParentPID: 1, CreatedAt: created}, MetadataError: "access denied"},
+		},
+		{
+			name:   "metadata probe failed",
+			detail: ProcessDetails{Process: core.Process{PID: 10, ParentPID: 1, CreatedAt: created}, MetadataAccessible: true, MetadataError: "command line: access denied"},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			snapshotter := &fakeSnapshotter{processes: []ProcessDetails{test.detail}}
+			native := &fakeNative{createdByPID: map[uint32]time.Time{10: created}}
+			supervisor := newSupervisor(&fakeResolver{}, native, snapshotter)
+			request := core.NewTerminationRequest("observed-10", []core.Process{test.detail.Process}).Confirm()
+
+			if err := supervisor.TerminateObserved(request, observedSession("observed-10", test.detail.Process)); err == nil {
+				t.Fatal("TerminateObserved() accepted inaccessible metadata")
+			}
+			if len(native.openedForTerminate) != 0 || len(native.terminatedPIDs) != 0 {
+				t.Fatalf("opened/terminated = %v/%v, want zero", native.openedForTerminate, native.terminatedPIDs)
+			}
+		})
+	}
+}
+
+func TestTerminateObservedRejectsFreshIdentitylessDescendant(t *testing.T) {
+	created := time.Unix(100, 0).UTC()
+	root := ProcessDetails{Process: core.Process{PID: 10, ParentPID: 1, CreatedAt: created}, MetadataAccessible: true}
+	current := []ProcessDetails{
+		root,
+		{Process: core.Process{PID: 11, ParentPID: 10}, MetadataError: "creation time unavailable"},
+	}
+	native := &fakeNative{createdByPID: map[uint32]time.Time{10: created}}
+	supervisor := newSupervisor(&fakeResolver{}, native, &fakeSnapshotter{processes: current})
+	request := core.NewTerminationRequest("observed-10", []core.Process{root.Process}).Confirm()
+
+	if err := supervisor.TerminateObserved(request, observedSession("observed-10", root.Process)); err == nil {
+		t.Fatal("TerminateObserved() accepted a fresh identity-less descendant")
+	}
+	if len(native.openedForTerminate) != 0 || len(native.terminatedPIDs) != 0 {
+		t.Fatalf("opened/terminated = %v/%v, want zero", native.openedForTerminate, native.terminatedPIDs)
+	}
+}
+
+func TestTerminateObservedRejectsNonObservedSession(t *testing.T) {
+	created := time.Unix(100, 0).UTC()
+	root := core.Process{PID: 10, ParentPID: 1, CreatedAt: created}
+	snapshotter := &fakeSnapshotter{}
+	native := &fakeNative{}
+	supervisor := newSupervisor(&fakeResolver{}, native, snapshotter)
+	request := core.NewTerminationRequest("session-10", []core.Process{root}).Confirm()
+	session := core.Session{ID: "session-10", Confidence: core.ConfidenceSupervised, Root: root.Identity()}
+
+	if err := supervisor.TerminateObserved(request, session); err == nil {
+		t.Fatal("TerminateObserved() accepted a non-observed session")
+	}
+	if snapshotter.calls != 0 {
+		t.Fatalf("snapshot calls = %d, want zero", snapshotter.calls)
 	}
 }
 

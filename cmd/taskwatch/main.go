@@ -107,5 +107,11 @@ func execute(args []string, stdout, stderr io.Writer, start func() error) int {
 }
 
 func main() {
+	if requested, err := windows.RunJobKeeperIfRequested(); requested {
+		if err != nil {
+			os.Exit(1)
+		}
+		return
+	}
 	os.Exit(execute(os.Args[1:], os.Stdout, os.Stderr, run))
 }

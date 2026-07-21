@@ -29,7 +29,7 @@ type nativeOperations interface {
 	openJob(name string) (nativeHandle, error)
 	createSuspended(executable, workspace string) (process, thread nativeHandle, pid uint32, err error)
 	assignProcess(job, process nativeHandle) error
-	duplicateJobHandleIntoProcess(job, process nativeHandle) error
+	startJobKeeper(job nativeHandle) error
 	resumeThread(thread nativeHandle) error
 	processCreatedAt(process nativeHandle) (time.Time, error)
 	terminateProcess(process nativeHandle) error
@@ -108,8 +108,8 @@ func (supervisor *Supervisor) Launch(tool core.Tool, workspace string) (core.Ses
 	if err := supervisor.native.assignProcess(job, process); err != nil {
 		return core.Session{}, fmt.Errorf("assign suspended process to job: %w", err)
 	}
-	if err := supervisor.native.duplicateJobHandleIntoProcess(job, process); err != nil {
-		return core.Session{}, fmt.Errorf("retain job for restart recovery: %w", err)
+	if err := supervisor.native.startJobKeeper(job); err != nil {
+		return core.Session{}, fmt.Errorf("start job keeper: %w", err)
 	}
 	if err := supervisor.native.resumeThread(thread); err != nil {
 		return core.Session{}, fmt.Errorf("resume supervised process: %w", err)
@@ -264,7 +264,7 @@ func refreshSession(session core.Session, pids []uint32, snapshot []ProcessDetai
 	for _, detail := range snapshot {
 		if _, exists := wanted[detail.Process.PID]; exists {
 			processes = append(processes, detail.Process)
-			if !detail.MetadataAccessible || detail.MetadataError != "" || detail.Process.CreatedAt.IsZero() {
+			if !detail.MetadataAccessible || detail.Process.CreatedAt.IsZero() {
 				inaccessible = true
 			}
 		}
@@ -393,65 +393,41 @@ func processDepth(process core.Process, byPID map[uint32]core.Process) int {
 // TerminateObserved re-snapshots the tree, checks exact PID+creation identity,
 // pre-opens every target, then terminates leaf-first. A failed preflight kills
 // nothing.
-func (supervisor *Supervisor) TerminateObserved(request core.TerminationRequest) error {
+func (supervisor *Supervisor) TerminateObserved(request core.TerminationRequest, session core.Session) error {
 	if !request.Confirmed() {
 		return errors.New("termination request is not confirmed")
 	}
-	targets := request.Targets()
-	if len(targets) == 0 {
+	if len(request.Targets()) == 0 {
 		return errors.New("termination request has no targets")
+	}
+	if request.SessionID() == "" || request.SessionID() != session.ID {
+		return errors.New("termination request does not belong to session")
+	}
+	if session.Confidence != core.ConfidenceObserved || session.Root.PID == 0 || session.Root.CreatedAt.IsZero() {
+		return errors.New("invalid observed session")
 	}
 	snapshot, err := supervisor.snapshotter.Snapshot()
 	if err != nil {
 		return fmt.Errorf("snapshot observed tree: %w", err)
 	}
+	detailsByPID := make(map[uint32]ProcessDetails, len(snapshot))
+	for _, detail := range snapshot {
+		detailsByPID[detail.Process.PID] = detail
+	}
 	allProcesses := detailsProcesses(snapshot)
-	var current []core.Process
-	var validationErr error
-	for _, possibleRoot := range targets {
-		candidate := core.CollectTree(allProcesses, possibleRoot)
-		validationErr = core.RevalidateObserved(request, candidate)
-		if validationErr == nil {
-			current = candidate
-			break
-		}
+	current := core.CollectTree(allProcesses, session.Root)
+	if observedTreeInaccessible(session.Root.PID, detailsByPID, current) {
+		return errors.New("current observed session metadata is inaccessible")
 	}
-	if validationErr != nil {
-		return fmt.Errorf("revalidate observed tree: %w", validationErr)
-	}
-
-	handles := make([]nativeHandle, 0, len(current))
 	for _, process := range current {
-		handle, openErr := supervisor.native.openProcessForTerminate(process.PID)
-		if openErr != nil {
-			for _, opened := range handles {
-				supervisor.native.closeHandle(opened)
-			}
-			return fmt.Errorf("preflight PID %d: %w", process.PID, openErr)
-		}
-		handles = append(handles, handle)
-		createdAt, identityErr := supervisor.native.processCreatedAt(handle)
-		if identityErr != nil || !core.SameProcess(process.Identity(), core.ProcessIdentity{PID: process.PID, CreatedAt: createdAt}) {
-			for _, opened := range handles {
-				supervisor.native.closeHandle(opened)
-			}
-			if identityErr != nil {
-				return fmt.Errorf("preflight identity for PID %d: %w", process.PID, identityErr)
-			}
-			return fmt.Errorf("preflight identity for PID %d changed", process.PID)
+		if detailsByPID[process.PID].MetadataError != "" {
+			return errors.New("current observed session metadata is inaccessible")
 		}
 	}
-	defer func() {
-		for _, handle := range handles {
-			supervisor.native.closeHandle(handle)
-		}
-	}()
-	for i := len(handles) - 1; i >= 0; i-- {
-		if err := supervisor.native.terminateOpenedProcess(handles[i]); err != nil {
-			return fmt.Errorf("terminate observed PID %d: %w", current[i].PID, err)
-		}
+	if err := core.RevalidateObserved(request, current); err != nil {
+		return fmt.Errorf("revalidate observed tree: %w", err)
 	}
-	return nil
+	return supervisor.terminateExactProcesses(current)
 }
 
 // Close releases TaskWatch's job handles without terminating their processes.
