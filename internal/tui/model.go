@@ -614,27 +614,21 @@ func (m *Model) applyInspectionResult(tree app.ProcessTree, err error, refreshin
 	m.clampInspectionScrollOffset()
 }
 
+// inspectionPageSize reports how many document lines PgUp/PgDn moves by: the
+// viewport size minus one line per "N more" indicator that would be visible
+// from the current scroll position (above once scrolled down, below unless
+// already at the end).
 func (m Model) inspectionPageSize() int {
-	if m.hasInspectionActivities() {
-		total := len(m.inspectionCombinedLines(m.width))
-		start := min(max(m.inspectionScrollOffset, 0), total)
-		size := m.inspectionRowViewportLineCount()
-		if start > 0 {
-			size--
-		}
-		if total-start > size {
-			size--
-		}
-		return max(1, min(size, total-start))
+	total := m.inspectionRowCount()
+	start := min(max(m.inspectionScrollOffset, 0), total)
+	size := m.inspectionRowViewportLineCount()
+	if start > 0 {
+		size--
 	}
-	start, end, _, _ := sessionWindow(
-		m.inspectionRowCount(), m.inspectionScrollOffset,
-		m.inspectionRowViewportLineCount(), inspectionRowsPerProcess(m.width),
-	)
-	if size := end - start; size > 0 {
-		return size
+	if total-start > size {
+		size--
 	}
-	return 1
+	return max(1, min(size, total-start))
 }
 
 func (m *Model) moveInspectionScroll(delta int) {
@@ -642,44 +636,21 @@ func (m *Model) moveInspectionScroll(delta int) {
 	m.clampInspectionScrollOffset()
 }
 
+// clampInspectionScrollOffset keeps the offset within [0, maxOffset] so the
+// document's final line always remains reachable, reserving one line for the
+// below-indicator except when the offset has scrolled past it.
 func (m *Model) clampInspectionScrollOffset() {
-	if m.hasInspectionActivities() {
-		total := len(m.inspectionCombinedLines(m.width))
-		viewport := m.inspectionRowViewportLineCount()
-		maxOffset := max(0, total-max(1, viewport-1))
-		m.inspectionScrollOffset = min(max(m.inspectionScrollOffset, 0), maxOffset)
-		return
-	}
 	total := m.inspectionRowCount()
-	if total == 0 {
-		m.inspectionScrollOffset = 0
-		return
-	}
 	viewport := m.inspectionRowViewportLineCount()
-	rowsPerProcess := inspectionRowsPerProcess(m.width)
-	capacity := viewport / rowsPerProcess
-	maxOffset := total - 1
-	if capacity >= total {
-		maxOffset = 0
-	} else if bottomCapacity := (viewport - 1) / rowsPerProcess; bottomCapacity > 0 {
-		maxOffset = total - bottomCapacity
-	}
-	if m.inspectionScrollOffset < 0 {
-		m.inspectionScrollOffset = 0
-	}
-	if m.inspectionScrollOffset > maxOffset {
-		m.inspectionScrollOffset = maxOffset
-	}
+	maxOffset := max(0, total-max(1, viewport-1))
+	m.inspectionScrollOffset = min(max(m.inspectionScrollOffset, 0), maxOffset)
 }
 
+// inspectionRowCount is always the length of the unified scrollable document:
+// session context, assessment, activity, resource breakdown, and process
+// tree rows combined. There is no longer a separate row-pagination path.
 func (m Model) inspectionRowCount() int {
-	if m.hasInspectionActivities() {
-		return len(m.inspectionCombinedLines(m.width))
-	}
-	if !m.inspectionRaw && m.inspectionTree.CompactRows != nil {
-		return len(m.inspectionTree.CompactRows)
-	}
-	return len(m.inspectionTree.Rows)
+	return len(m.inspectionDocumentLines(m.width))
 }
 
 func inspectionRowsPerProcess(width int) int {
@@ -715,6 +686,10 @@ func (m Model) effectiveInspectionRowViewportLineCount(viewportLines int) int {
 	return viewportLines
 }
 
+// inspectionViewportLineCount is the height budget left for the scrollable
+// document after the fixed header and the mandatory one-line footer. Session
+// context, section headings, and process-tree headings are now part of the
+// document itself, so no extra fixed-line reservation is needed here.
 func (m Model) inspectionViewportLineCount() int {
 	width := m.width
 	if width < 1 {
@@ -725,11 +700,7 @@ func (m Model) inspectionViewportLineCount() int {
 		height = 24
 	}
 	headerLines := len(truncateHeaderLines(m.headerLines(width), height))
-	fixedLines := headerLines + 2 + 1 // context + footer
-	if width >= 110 && !m.hasInspectionActivities() {
-		fixedLines++
-	}
-	viewport := height - fixedLines
+	viewport := height - headerLines - 1 // footer
 	if viewport < 0 {
 		return 0
 	}

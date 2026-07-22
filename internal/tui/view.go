@@ -68,9 +68,9 @@ func inspectionFooterLine(width int, raw bool) string {
 		toggle = "t compact"
 	}
 	hints := []string{
-		"No termination keys • ↑/↓ scroll • PgUp/PgDn page • " + toggle + " • r refresh • Enter/Esc back • Ctrl+C close",
-		"↑/↓ • PgUp/PgDn • " + toggle + " • r • Enter/Esc • ^C",
-		"↑↓ • " + toggle + " • r • Enter/Esc • ^C",
+		"READ ONLY · no termination keys • ↑/↓ scroll • PgUp/PgDn page • " + toggle + " • r refresh • Enter/Esc back • Ctrl+C close",
+		"READ ONLY · no termination keys • ↑/↓ • PgUp/PgDn • " + toggle + " • r • Enter/Esc • ^C",
+		"READ ONLY • " + toggle + " • r • Enter/Esc • ^C",
 	}
 	for _, hint := range hints {
 		if lipgloss.Width(hint) <= width {
@@ -666,9 +666,9 @@ func workspaceEditorWindow(draft string, cursor, width int) string {
 	return leading + string(runes[start:cursor]) + cursorGlyph + string(runes[cursor:end]) + trailing
 }
 
-// renderInspection draws a read-only, live process-tree screen. Header,
-// context, optional heading, viewport, and footer share one explicit height
-// budget so even tiny terminals retain the footer as their final line.
+// renderInspection draws a read-only, live process-tree screen: a fixed
+// header, a single scrollable document (context, assessment, activity,
+// resources, process tree), and a fixed footer as the final line.
 func (m Model) renderInspection(width, height int) string {
 	header := truncateHeaderLines(m.headerLines(width), height)
 	lines := append([]string{}, header...)
@@ -677,17 +677,6 @@ func (m Model) renderInspection(width, height int) string {
 		remaining = 0
 	}
 
-	context := m.inspectionContextLines(width)
-	if len(context) > remaining {
-		context = context[:remaining]
-	}
-	lines = append(lines, context...)
-	remaining -= len(context)
-
-	if width >= 110 && remaining > 0 && !m.hasInspectionActivities() {
-		lines = append(lines, m.palette.muted.Render(clip(inspectionHeading(), width)))
-		remaining--
-	}
 	lines = append(lines, m.renderInspectionViewport(width, remaining)...)
 	lines = append(lines, m.palette.muted.Render(inspectionFooterLine(width, m.inspectionRaw)))
 	return strings.Join(lines, "\n")
@@ -743,25 +732,29 @@ func activityHeading() string {
 	return fmt.Sprintf("%-9s %-10s %-12s %-14s %-7s %-8s %-10s %s", "THREAD", "STATE", "LAST TOOL", "MODEL", "CTX", "UPDATED", "MATCH", "WORKSPACE")
 }
 
-func (m Model) hasInspectionActivities() bool {
-	return len(m.inspectionSession().Activities) > 0
-}
+// inspectionDocumentLines builds the entire inspection screen as one ordered
+// list of rendered lines: session context, assessment, agent activity,
+// resource breakdown, then the compact or raw process tree. This is the single
+// scrollable document; renderInspectionViewport windows it.
+func (m Model) inspectionDocumentLines(width int) []string {
+	lines := append([]string{}, m.inspectionContextLines(width)...)
+	lines = append(lines, "")
+	lines = append(lines, m.inspectionAssessmentLines(width)...)
+	lines = append(lines, "")
+	lines = append(lines, m.inspectionActivityLines(width)...)
+	lines = append(lines, "")
+	lines = append(lines, m.inspectionResourceLines(width)...)
+	lines = append(lines, "")
 
-func (m Model) inspectionCombinedLines(width int) []string {
-	activities := append([]core.AgentActivity(nil), m.inspectionSession().Activities...)
-	sort.SliceStable(activities, func(i, j int) bool { return activities[i].UpdatedAt.After(activities[j].UpdatedAt) })
-	lines := []string{m.palette.focus.Render(clip("AGENT ACTIVITY", width))}
-	if width >= 110 {
-		lines = append(lines, m.palette.muted.Render(clip(activityHeading(), width)))
+	compact := !m.inspectionRaw && m.inspectionTree.CompactRows != nil
+	treeHeading := "PROCESS TREE · COMPACT"
+	if m.inspectionRaw {
+		treeHeading = "PROCESS TREE · RAW"
 	}
-	for _, activity := range activities {
-		lines = append(lines, m.renderInspectionActivity(activity, width)...)
-	}
-	lines = append(lines, "", m.palette.focus.Render(clip("PROCESS TREE", width)))
+	lines = append(lines, m.palette.focus.Render(clip(treeHeading, width)))
 	if width >= 110 {
 		lines = append(lines, m.palette.muted.Render(clip(inspectionHeading(), width)))
 	}
-	compact := !m.inspectionRaw && m.inspectionTree.CompactRows != nil
 	if compact {
 		for _, row := range m.inspectionTree.CompactRows {
 			lines = append(lines, m.renderCompactInspectionProcess(row, width)...)
@@ -777,7 +770,90 @@ func (m Model) inspectionCombinedLines(width int) []string {
 	return lines
 }
 
-func (m Model) renderInspectionActivity(activity core.AgentActivity, width int) []string {
+// inspectionAssessmentLines renders the ASSESSMENT section: the status label
+// (colored by Assessment.Status), the summary, and a "Why" block that always
+// lists every reason — even when the assessment is OK — since the explanation
+// is part of the trust model (Safety Invariant: reasons are always visible).
+func (m Model) inspectionAssessmentLines(width int) []string {
+	assessment := m.inspectionTree.Assessment
+	lines := []string{m.palette.focus.Render(clip("ASSESSMENT", width))}
+
+	labelStyle := m.palette.text
+	switch assessment.Status {
+	case core.AssessmentNeedsReview:
+		labelStyle = m.palette.warning
+	case core.AssessmentUnknown:
+		labelStyle = m.palette.failure
+	case core.AssessmentOK:
+		labelStyle = m.palette.healthy
+	}
+	if assessment.Label != "" {
+		lines = append(lines, labelStyle.Render(clip(assessment.Label, width)))
+	}
+	if assessment.Summary != "" {
+		lines = append(lines, m.palette.text.Render(clip(assessment.Summary, width)))
+	}
+	lines = append(lines, "")
+
+	why := "Why TaskWatch says this"
+	if assessment.Status != core.AssessmentOK {
+		why = "Why TaskWatch flagged this"
+	}
+	lines = append(lines, m.palette.muted.Render(clip(why, width)))
+	for _, reason := range assessment.Reasons {
+		lines = append(lines, m.palette.text.Render(clip("• "+reason, width)))
+	}
+	return lines
+}
+
+// inspectionActivityLines renders the AGENT ACTIVITY section from the
+// coordinator's in-memory ActivityHistory (never session.Activities): the
+// dashboard's own activity rendering is untouched and keeps reading
+// session.Activities directly.
+func (m Model) inspectionActivityLines(width int) []string {
+	lines := []string{m.palette.focus.Render(clip("AGENT ACTIVITY", width))}
+	session := m.inspectionSession()
+	history := m.inspectionTree.ActivityHistory
+
+	switch {
+	case session.Tool == core.ToolClaudeCLI:
+		lines = append(lines, m.palette.muted.Render(clip("Activity signal unavailable for Claude in this preview.", width)))
+		return lines
+	case len(history) == 0:
+		lines = append(lines, m.palette.muted.Render(clip("No Codex activity observed during this TaskWatch run.", width)))
+		return lines
+	}
+
+	observations := append([]app.ActivityObservation(nil), history...)
+	sort.SliceStable(observations, func(i, j int) bool {
+		return observations[i].LastSignalAt.After(observations[j].LastSignalAt)
+	})
+	if width >= 110 {
+		lines = append(lines, m.palette.muted.Render(clip(activityHeading(), width)))
+	}
+	for _, observation := range observations {
+		lines = append(lines, m.renderInspectionActivity(observation, width)...)
+	}
+	return lines
+}
+
+// activityStateLabel maps an activity state to the plain-language label shown
+// to users; missing/unrecognized data is always "Unknown", never "idle".
+func activityStateLabel(state core.ActivityState) string {
+	switch state {
+	case core.ActivityThinking:
+		return "Thinking"
+	case core.ActivityExecuting:
+		return "Executing"
+	case core.ActivityWaiting:
+		return "Waiting"
+	default:
+		return "Unknown"
+	}
+}
+
+func (m Model) renderInspectionActivity(observation app.ActivityObservation, width int) []string {
+	activity := observation.Activity
 	value := func(value string) string {
 		if value == "" {
 			return "—"
@@ -789,19 +865,31 @@ func (m Model) renderInspectionActivity(activity core.AgentActivity, width int) 
 		threadID = threadID[:8]
 	}
 	context := activityContextLabel(activity)
-	updated := "—"
-	if !activity.UpdatedAt.IsZero() {
-		updated = ageLabel(activity.UpdatedAt, m.now())
+	signalAge := "—"
+	if !observation.LastSignalAt.IsZero() {
+		signalAge = ageLabel(observation.LastSignalAt, m.now())
 	}
+	stateAge := "—"
+	if !observation.StateChangedAt.IsZero() {
+		stateAge = ageLabel(observation.StateChangedAt, m.now())
+	}
+	currency := "retained"
+	if observation.SignalCurrent {
+		currency = "current"
+	}
+	state := activityStateLabel(activity.State)
+
 	if width >= 110 {
 		line := fmt.Sprintf("%-9s %-10s %-12s %-14s %-7s %-8s %-10s %s",
-			value(threadID), value(string(activity.State)), value(activity.LastTool), value(activity.Model), context,
-			updated, value(string(activity.Correlation)), value(activity.Workspace))
-		return []string{m.palette.text.Render(clip(line, width))}
+			value(threadID), state, value(activity.LastTool), value(activity.Model), context,
+			signalAge, value(string(activity.Correlation)), value(activity.Workspace))
+		history := fmt.Sprintf("state %s ago · %s", stateAge, currency)
+		return []string{m.palette.text.Render(clip(line, width)), m.palette.muted.Render(clip(history, width))}
 	}
-	first := strings.Join([]string{value(threadID), value(string(activity.State)), value(activity.LastTool), context}, " · ")
-	second := strings.Join([]string{value(activity.Model), updated, value(string(activity.Correlation)), value(activity.Workspace)}, " · ")
-	return []string{m.palette.text.Render(clip(first, width)), m.palette.muted.Render(clip(second, width))}
+	first := strings.Join([]string{value(threadID), state, value(activity.LastTool), context}, " · ")
+	second := strings.Join([]string{value(activity.Model), "signal " + signalAge, value(string(activity.Correlation)), value(activity.Workspace)}, " · ")
+	third := fmt.Sprintf("state changed %s ago · %s", stateAge, currency)
+	return []string{m.palette.text.Render(clip(first, width)), m.palette.muted.Render(clip(second, width)), m.palette.muted.Render(clip(third, width))}
 }
 
 func activityContextLabel(activity core.AgentActivity) string {
@@ -811,15 +899,46 @@ func activityContextLabel(activity core.AgentActivity) string {
 	return fmt.Sprintf("%.1f%%", float64(activity.ContextTokens)/float64(activity.ContextWindow)*100)
 }
 
+// inspectionResourceLines renders the RESOURCE BREAKDOWN section from
+// ProcessTree.RoleSummaries, which already excludes empty roles.
+func (m Model) inspectionResourceLines(width int) []string {
+	summaries := m.inspectionTree.RoleSummaries
+	total := 0
+	for _, summary := range summaries {
+		total += summary.ProcessCount
+	}
+	heading := fmt.Sprintf("RESOURCE BREAKDOWN · %d PROCESSES ACROSS %d ROLES", total, len(summaries))
+	lines := []string{m.palette.focus.Render(clip(heading, width))}
+
+	if width >= 110 {
+		columns := fmt.Sprintf("%-22s %-11s %-9s %s", "ROLE", "PROCESSES", "CPU", "MEMORY")
+		lines = append(lines, m.palette.muted.Render(clip(columns, width)))
+		for _, summary := range summaries {
+			row := fmt.Sprintf("%-22s %-11d %-9s %s", core.ProcessRoleLabel(summary.Role), summary.ProcessCount,
+				resourceCPULabel(summary.Resources), memoryLabel(summary.Resources))
+			lines = append(lines, m.palette.text.Render(clip(row, width)))
+		}
+		return lines
+	}
+
+	for _, summary := range summaries {
+		first := fmt.Sprintf("%s · %d procs", core.ProcessRoleLabel(summary.Role), summary.ProcessCount)
+		second := fmt.Sprintf("CPU %s · Mem %s", resourceCPULabel(summary.Resources), memoryLabel(summary.Resources))
+		lines = append(lines, m.palette.text.Render(clip(first, width)), m.palette.muted.Render(clip(second, width)))
+	}
+	return lines
+}
+
+// renderInspectionViewport windows the full inspectionDocumentLines document
+// (or a loading/error state) into the height budget, with "N more"
+// indicators above/below when content is scrolled.
 func (m Model) renderInspectionViewport(width, viewportLines int) []string {
 	if viewportLines <= 0 {
 		return nil
 	}
-	total := m.inspectionRowCount()
-	compact := !m.inspectionRaw && m.inspectionTree.CompactRows != nil
 	var body []string
 
-	if m.inspectionPending && total == 0 {
+	if m.inspectionPending {
 		return []string{m.palette.focus.Render(clip("Loading process tree…", width))}
 	}
 	if m.inspectionErr != nil {
@@ -830,59 +949,31 @@ func (m Model) renderInspectionViewport(width, viewportLines int) []string {
 			style = m.palette.warning
 		}
 		body = append(body, style.Render(clip(message, width)))
-		if errors.Is(m.inspectionErr, app.ErrSessionNotFound) || total == 0 || len(body) >= viewportLines {
+		if errors.Is(m.inspectionErr, app.ErrSessionNotFound) || len(body) >= viewportLines {
 			return body[:min(len(body), viewportLines)]
 		}
-	}
-	if m.hasInspectionActivities() {
-		content := m.inspectionCombinedLines(width)
-		budget := viewportLines - len(body)
-		if budget <= 0 {
-			return body[:min(len(body), viewportLines)]
-		}
-		start := min(max(m.inspectionScrollOffset, 0), max(len(content)-1, 0))
-		if start > 0 && budget > 0 {
-			body = append(body, m.palette.muted.Render(clip(fmt.Sprintf("↑ %d more", start), width)))
-			budget--
-		}
-		end := min(len(content), start+budget)
-		showBelow := end < len(content)
-		if showBelow && end > start && budget > 0 {
-			end--
-		}
-		body = append(body, content[start:end]...)
-		if showBelow && len(body) < viewportLines {
-			body = append(body, m.palette.muted.Render(clip(fmt.Sprintf("↓ %d more", len(content)-end), width)))
-		}
-		return body[:min(len(body), viewportLines)]
-	}
-	if total == 0 {
-		body = append(body, m.palette.muted.Render(clip("No processes remain for this session.", width)))
-		return body[:min(len(body), viewportLines)]
 	}
 
-	rowBudget := m.effectiveInspectionRowViewportLineCount(viewportLines)
-	rowsPerProcess := inspectionRowsPerProcess(width)
-	start, end, showAbove, showBelow := sessionWindow(total, m.inspectionScrollOffset, rowBudget, rowsPerProcess)
-	if showAbove {
+	content := m.inspectionDocumentLines(width)
+	budget := viewportLines - len(body)
+	if budget <= 0 {
+		return body[:min(len(body), viewportLines)]
+	}
+	start := min(max(m.inspectionScrollOffset, 0), max(len(content)-1, 0))
+	if start > 0 && budget > 0 {
 		body = append(body, m.palette.muted.Render(clip(fmt.Sprintf("↑ %d more", start), width)))
+		budget--
 	}
-	if compact {
-		for _, row := range m.inspectionTree.CompactRows[start:end] {
-			body = append(body, m.renderCompactInspectionProcess(row, width)...)
-		}
-	} else {
-		for _, row := range m.inspectionTree.Rows[start:end] {
-			body = append(body, m.renderInspectionProcess(row, width)...)
-		}
+	end := min(len(content), start+budget)
+	showBelow := end < len(content)
+	if showBelow && end > start && budget > 0 {
+		end--
 	}
-	if showBelow {
-		body = append(body, m.palette.muted.Render(clip(fmt.Sprintf("↓ %d more", total-end), width)))
+	body = append(body, content[start:end]...)
+	if showBelow && len(body) < viewportLines {
+		body = append(body, m.palette.muted.Render(clip(fmt.Sprintf("↓ %d more", len(content)-end), width)))
 	}
-	if len(body) > viewportLines {
-		body = body[:viewportLines]
-	}
-	return body
+	return body[:min(len(body), viewportLines)]
 }
 
 func (m Model) renderCompactInspectionProcess(row core.CompactProcessRow, width int) []string {

@@ -1601,3 +1601,395 @@ func clockSequence(times ...time.Time) func() time.Time {
 		return result
 	}
 }
+
+// --- Task 3: in-memory activity history + inspection projection ---
+//
+// These tests exercise recordActivityObservations and Inspect's
+// ActivityHistory projection exclusively through the public Coordinator
+// surface (newCoordinatorWithActivity, Start, Refresh, Inspect) plus the
+// existing fake store/supervisor/observer/collector harness above. No store
+// interface method gained a new call shape and no serialized session field
+// changed: fakeStore.Save/Load still see only core.Session, confirming the
+// store schema is untouched by this history feature.
+
+func desktopObserved(id string, startedAt time.Time) core.Session {
+	s := session(id, core.ConfidenceObserved, core.StateRunning, startedAt, process(90, startedAt))
+	s.Tool = core.ToolCodexDesktop
+	s.Root = s.Processes[0].Identity()
+	return s
+}
+
+func TestRecordActivityObservationsNewThreadIsFirstObservedNow(t *testing.T) {
+	store := &fakeStore{}
+	observed := desktopObserved("desktop", baseTime)
+	observer := &fakeObserver{results: []observation{{sessions: []core.Session{observed}}}}
+	collector := &fakeActivityCollector{activities: []core.AgentActivity{{
+		ThreadID: "thread-1", Tool: core.ToolCodexDesktop, State: core.ActivityThinking, UpdatedAt: cycleOne,
+	}}}
+	coordinator := newCoordinatorWithActivity("workspace", store, &fakeSupervisor{}, observer, collector, func() time.Time { return cycleOne })
+
+	if _, err := coordinator.Start(); err != nil {
+		t.Fatalf("Start() error = %v", err)
+	}
+
+	tree, err := coordinator.Inspect("desktop")
+	if err != nil {
+		t.Fatalf("Inspect() error = %v", err)
+	}
+	if len(tree.ActivityHistory) != 1 {
+		t.Fatalf("ActivityHistory = %#v, want one observation", tree.ActivityHistory)
+	}
+	got := tree.ActivityHistory[0]
+	if got.Activity.ThreadID != "thread-1" || !got.FirstObservedAt.Equal(cycleOne) || !got.LastSignalAt.Equal(cycleOne) || !got.StateChangedAt.Equal(cycleOne) || !got.SignalCurrent {
+		t.Fatalf("new observation = %#v, want FirstObservedAt/LastSignalAt/StateChangedAt = cycleOne and SignalCurrent = true", got)
+	}
+}
+
+func TestRecordActivityObservationsRepeatedSameStateDoesNotChangeStateChangedAt(t *testing.T) {
+	store := &fakeStore{}
+	observed := desktopObserved("desktop", baseTime)
+	observer := &fakeObserver{results: []observation{{sessions: []core.Session{observed}}, {sessions: []core.Session{observed}}}}
+	collector := &fakeActivityCollector{activities: []core.AgentActivity{{
+		ThreadID: "thread-1", Tool: core.ToolCodexDesktop, State: core.ActivityThinking, UpdatedAt: cycleOne,
+	}}}
+	coordinator := newCoordinatorWithActivity("workspace", store, &fakeSupervisor{}, observer, collector, func() time.Time { return cycleOne })
+	if _, err := coordinator.Start(); err != nil {
+		t.Fatal(err)
+	}
+
+	// Second poll: same activity, later signal time, same state.
+	collector.activities = []core.AgentActivity{{
+		ThreadID: "thread-1", Tool: core.ToolCodexDesktop, State: core.ActivityThinking, UpdatedAt: cycleTwo,
+	}}
+	coordinator.now = func() time.Time { return cycleTwo }
+	coordinator.Refresh()
+
+	tree, err := coordinator.Inspect("desktop")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(tree.ActivityHistory) != 1 {
+		t.Fatalf("ActivityHistory = %#v, want one observation", tree.ActivityHistory)
+	}
+	got := tree.ActivityHistory[0]
+	if !got.LastSignalAt.Equal(cycleTwo) {
+		t.Fatalf("LastSignalAt = %v, want updated to %v", got.LastSignalAt, cycleTwo)
+	}
+	if !got.StateChangedAt.Equal(cycleOne) {
+		t.Fatalf("StateChangedAt = %v, want unchanged %v (no state transition)", got.StateChangedAt, cycleOne)
+	}
+	if !got.FirstObservedAt.Equal(cycleOne) {
+		t.Fatalf("FirstObservedAt = %v, want unchanged %v", got.FirstObservedAt, cycleOne)
+	}
+}
+
+func TestRecordActivityObservationsStateTransitionUpdatesStateChangedAt(t *testing.T) {
+	store := &fakeStore{}
+	observed := desktopObserved("desktop", baseTime)
+	observer := &fakeObserver{results: []observation{{sessions: []core.Session{observed}}, {sessions: []core.Session{observed}}}}
+	collector := &fakeActivityCollector{activities: []core.AgentActivity{{
+		ThreadID: "thread-1", Tool: core.ToolCodexDesktop, State: core.ActivityThinking, UpdatedAt: cycleOne,
+	}}}
+	coordinator := newCoordinatorWithActivity("workspace", store, &fakeSupervisor{}, observer, collector, func() time.Time { return cycleOne })
+	if _, err := coordinator.Start(); err != nil {
+		t.Fatal(err)
+	}
+
+	collector.activities = []core.AgentActivity{{
+		ThreadID: "thread-1", Tool: core.ToolCodexDesktop, State: core.ActivityExecuting, UpdatedAt: cycleTwo,
+	}}
+	coordinator.now = func() time.Time { return cycleTwo }
+	coordinator.Refresh()
+
+	tree, err := coordinator.Inspect("desktop")
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := tree.ActivityHistory[0]
+	if got.Activity.State != core.ActivityExecuting {
+		t.Fatalf("Activity.State = %v, want executing", got.Activity.State)
+	}
+	if !got.StateChangedAt.Equal(cycleTwo) {
+		t.Fatalf("StateChangedAt = %v, want %v after state transition", got.StateChangedAt, cycleTwo)
+	}
+	if !got.LastSignalAt.Equal(cycleTwo) {
+		t.Fatalf("LastSignalAt = %v, want %v", got.LastSignalAt, cycleTwo)
+	}
+}
+
+func TestRecordActivityObservationsSameStateDifferentToolUpdatesActivityWithoutStateChange(t *testing.T) {
+	store := &fakeStore{}
+	observed := desktopObserved("desktop", baseTime)
+	observer := &fakeObserver{results: []observation{{sessions: []core.Session{observed}}, {sessions: []core.Session{observed}}}}
+	collector := &fakeActivityCollector{activities: []core.AgentActivity{{
+		ThreadID: "thread-1", Tool: core.ToolCodexDesktop, State: core.ActivityExecuting, LastTool: "read_file", UpdatedAt: cycleOne,
+	}}}
+	coordinator := newCoordinatorWithActivity("workspace", store, &fakeSupervisor{}, observer, collector, func() time.Time { return cycleOne })
+	if _, err := coordinator.Start(); err != nil {
+		t.Fatal(err)
+	}
+
+	collector.activities = []core.AgentActivity{{
+		ThreadID: "thread-1", Tool: core.ToolCodexDesktop, State: core.ActivityExecuting, LastTool: "write_file", UpdatedAt: cycleTwo,
+	}}
+	coordinator.now = func() time.Time { return cycleTwo }
+	coordinator.Refresh()
+
+	tree, err := coordinator.Inspect("desktop")
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := tree.ActivityHistory[0]
+	if got.Activity.LastTool != "write_file" {
+		t.Fatalf("Activity.LastTool = %q, want updated to write_file", got.Activity.LastTool)
+	}
+	if !got.LastSignalAt.Equal(cycleTwo) {
+		t.Fatalf("LastSignalAt = %v, want %v", got.LastSignalAt, cycleTwo)
+	}
+	if !got.StateChangedAt.Equal(cycleOne) {
+		t.Fatalf("StateChangedAt = %v, want unchanged %v (state itself did not change)", got.StateChangedAt, cycleOne)
+	}
+}
+
+func TestRecordActivityObservationsRetainsOutOfWindowActivityAsNotCurrent(t *testing.T) {
+	store := &fakeStore{}
+	observed := desktopObserved("desktop", baseTime)
+	observer := &fakeObserver{results: []observation{{sessions: []core.Session{observed}}, {sessions: []core.Session{observed}}}}
+	collector := &fakeActivityCollector{activities: []core.AgentActivity{{
+		ThreadID: "thread-1", Tool: core.ToolCodexDesktop, State: core.ActivityThinking, UpdatedAt: cycleOne,
+	}}}
+	coordinator := newCoordinatorWithActivity("workspace", store, &fakeSupervisor{}, observer, collector, func() time.Time { return cycleOne })
+	if _, err := coordinator.Start(); err != nil {
+		t.Fatal(err)
+	}
+
+	// Second poll: the collector no longer reports the thread (it fell out of
+	// the 15-minute collector window), but the session is still present.
+	collector.activities = nil
+	later := cycleOne.Add(20 * time.Minute)
+	coordinator.now = func() time.Time { return later }
+	coordinator.Refresh()
+
+	tree, err := coordinator.Inspect("desktop")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(tree.ActivityHistory) != 1 {
+		t.Fatalf("ActivityHistory = %#v, want retained single observation", tree.ActivityHistory)
+	}
+	got := tree.ActivityHistory[0]
+	if got.SignalCurrent {
+		t.Fatal("SignalCurrent = true, want false for an activity absent this round")
+	}
+	if !got.LastSignalAt.Equal(cycleOne) || !got.StateChangedAt.Equal(cycleOne) {
+		t.Fatalf("retained timestamps = %#v, want frozen at cycleOne", got)
+	}
+}
+
+func TestRecordActivityObservationsSessionRemovalDeletesObservations(t *testing.T) {
+	store := &fakeStore{}
+	observed := desktopObserved("desktop", baseTime)
+	observer := &fakeObserver{results: []observation{{sessions: []core.Session{observed}}, {}}}
+	collector := &fakeActivityCollector{activities: []core.AgentActivity{{
+		ThreadID: "thread-1", Tool: core.ToolCodexDesktop, State: core.ActivityThinking, UpdatedAt: cycleOne,
+	}}}
+	coordinator := newCoordinatorWithActivity("workspace", store, &fakeSupervisor{}, observer, collector, func() time.Time { return cycleOne })
+	if _, err := coordinator.Start(); err != nil {
+		t.Fatal(err)
+	}
+	if len(coordinator.activityObservations) != 1 {
+		t.Fatalf("activityObservations = %#v, want one entry after first poll", coordinator.activityObservations)
+	}
+
+	// Second poll: the session disappears entirely (observer no longer reports it).
+	collector.activities = nil
+	coordinator.now = func() time.Time { return cycleTwo }
+	coordinator.Refresh()
+
+	if len(coordinator.activityObservations) != 0 {
+		t.Fatalf("activityObservations = %#v, want cleared after session disappears", coordinator.activityObservations)
+	}
+}
+
+func TestRecordActivityObservationsRootIdentityReplacementResetsHistory(t *testing.T) {
+	rootOne := core.ProcessIdentity{PID: 90, CreatedAt: baseTime}
+	rootTwo := core.ProcessIdentity{PID: 91, CreatedAt: cycleTwo}
+	first := core.Session{ID: "desktop", Tool: core.ToolCodexDesktop, State: core.StateRunning, Root: rootOne, StartedAt: baseTime, Processes: []core.Process{{PID: 90, CreatedAt: baseTime}}}
+	second := core.Session{ID: "desktop", Tool: core.ToolCodexDesktop, State: core.StateRunning, Root: rootTwo, StartedAt: cycleTwo, Processes: []core.Process{{PID: 91, CreatedAt: cycleTwo}}}
+	store := &fakeStore{}
+	observer := &fakeObserver{results: []observation{{sessions: []core.Session{first}}, {sessions: []core.Session{second}}}}
+	collector := &fakeActivityCollector{activities: []core.AgentActivity{{
+		ThreadID: "thread-1", Tool: core.ToolCodexDesktop, State: core.ActivityThinking, UpdatedAt: cycleOne,
+	}}}
+	coordinator := newCoordinatorWithActivity("workspace", store, &fakeSupervisor{}, observer, collector, func() time.Time { return cycleOne })
+	if _, err := coordinator.Start(); err != nil {
+		t.Fatal(err)
+	}
+
+	// Second poll: same session ID reappears with a replaced root identity and
+	// a different thread; the old thread's history must not survive.
+	collector.activities = []core.AgentActivity{{
+		ThreadID: "thread-2", Tool: core.ToolCodexDesktop, State: core.ActivityWaiting, UpdatedAt: cycleTwo,
+	}}
+	coordinator.now = func() time.Time { return cycleTwo }
+	coordinator.Refresh()
+
+	tree, err := coordinator.Inspect("desktop")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(tree.ActivityHistory) != 1 || tree.ActivityHistory[0].Activity.ThreadID != "thread-2" {
+		t.Fatalf("ActivityHistory = %#v, want only thread-2 surviving the root identity replacement", tree.ActivityHistory)
+	}
+	if !tree.ActivityHistory[0].FirstObservedAt.Equal(cycleTwo) {
+		t.Fatalf("FirstObservedAt = %v, want %v (fresh observation, not inherited from thread-1)", tree.ActivityHistory[0].FirstObservedAt, cycleTwo)
+	}
+}
+
+func TestStartClearsActivityObservations(t *testing.T) {
+	store := &fakeStore{}
+	observed := desktopObserved("desktop", baseTime)
+	observer := &fakeObserver{results: []observation{{sessions: []core.Session{observed}}, {sessions: []core.Session{observed}}}}
+	collector := &fakeActivityCollector{activities: []core.AgentActivity{{
+		ThreadID: "thread-1", Tool: core.ToolCodexDesktop, State: core.ActivityThinking, UpdatedAt: cycleOne,
+	}}}
+	coordinator := newCoordinatorWithActivity("workspace", store, &fakeSupervisor{}, observer, collector, func() time.Time { return cycleOne })
+	if _, err := coordinator.Start(); err != nil {
+		t.Fatal(err)
+	}
+	if len(coordinator.activityObservations) != 1 {
+		t.Fatalf("activityObservations = %#v, want one entry after first Start()", coordinator.activityObservations)
+	}
+
+	// Restarting (as happens on process restart / store reload) must reset
+	// all in-memory history, even though the same session/thread reappears.
+	coordinator.now = func() time.Time { return cycleTwo }
+	if _, err := coordinator.Start(); err != nil {
+		t.Fatal(err)
+	}
+
+	tree, err := coordinator.Inspect("desktop")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(tree.ActivityHistory) != 1 || !tree.ActivityHistory[0].FirstObservedAt.Equal(cycleTwo) {
+		t.Fatalf("ActivityHistory = %#v, want fresh observation dated at second Start()'s now()", tree.ActivityHistory)
+	}
+}
+
+func TestRecordActivityObservationsTracksMultipleDesktopThreadsIndependently(t *testing.T) {
+	// A single Desktop session may host multiple concurrent Codex threads;
+	// attachActivities fans all matching Tool activities onto the lone
+	// Desktop session, so history must key independently per thread.
+	store := &fakeStore{}
+	observed := desktopObserved("desktop", baseTime)
+	observer := &fakeObserver{results: []observation{{sessions: []core.Session{observed}}}}
+	collector := &fakeActivityCollector{activities: []core.AgentActivity{
+		{ThreadID: "thread-a", Tool: core.ToolCodexDesktop, State: core.ActivityThinking, UpdatedAt: cycleOne},
+		{ThreadID: "thread-b", Tool: core.ToolCodexDesktop, State: core.ActivityExecuting, UpdatedAt: cycleOne},
+	}}
+	coordinator := newCoordinatorWithActivity("workspace", store, &fakeSupervisor{}, observer, collector, func() time.Time { return cycleOne })
+	if _, err := coordinator.Start(); err != nil {
+		t.Fatal(err)
+	}
+
+	tree, err := coordinator.Inspect("desktop")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(tree.ActivityHistory) != 2 {
+		t.Fatalf("ActivityHistory = %#v, want two independently tracked threads", tree.ActivityHistory)
+	}
+	byThread := map[string]ActivityObservation{}
+	for _, obs := range tree.ActivityHistory {
+		byThread[obs.Activity.ThreadID] = obs
+	}
+	if byThread["thread-a"].Activity.State != core.ActivityThinking || byThread["thread-b"].Activity.State != core.ActivityExecuting {
+		t.Fatalf("byThread = %#v, want each thread keeping its own state", byThread)
+	}
+}
+
+func TestInspectClaudeSessionYieldsEmptyActivityHistory(t *testing.T) {
+	store := &fakeStore{}
+	claude := session("claude", core.ConfidenceSupervised, core.StateRunning, baseTime, process(5, baseTime))
+	claude.Tool = core.ToolClaudeCLI
+	supervisor := &fakeSupervisor{recovered: []core.Session{claude}, recoverErrs: []error{nil}}
+	store.sessions = []core.Session{claude}
+	observer := &fakeObserver{results: []observation{{}}}
+	collector := &fakeActivityCollector{}
+	coordinator := newCoordinatorWithActivity("workspace", store, supervisor, observer, collector, func() time.Time { return cycleOne })
+	if _, err := coordinator.Start(); err != nil {
+		t.Fatal(err)
+	}
+
+	tree, err := coordinator.Inspect("claude")
+	if err != nil {
+		t.Fatalf("Inspect() error = %v", err)
+	}
+	if tree.ActivityHistory == nil || len(tree.ActivityHistory) != 0 {
+		t.Fatalf("ActivityHistory = %#v, want a non-nil empty slice for a Claude session", tree.ActivityHistory)
+	}
+}
+
+func TestInspectActivityHistoryIsADefensiveCopy(t *testing.T) {
+	store := &fakeStore{}
+	observed := desktopObserved("desktop", baseTime)
+	observer := &fakeObserver{results: []observation{{sessions: []core.Session{observed}}}}
+	collector := &fakeActivityCollector{activities: []core.AgentActivity{{
+		ThreadID: "thread-1", Tool: core.ToolCodexDesktop, State: core.ActivityThinking, LastTool: "original", UpdatedAt: cycleOne,
+	}}}
+	coordinator := newCoordinatorWithActivity("workspace", store, &fakeSupervisor{}, observer, collector, func() time.Time { return cycleOne })
+	if _, err := coordinator.Start(); err != nil {
+		t.Fatal(err)
+	}
+
+	first, err := coordinator.Inspect("desktop")
+	if err != nil {
+		t.Fatal(err)
+	}
+	first.ActivityHistory[0].Activity.LastTool = "mutated"
+	first.ActivityHistory[0].SignalCurrent = false
+	first.ActivityHistory = append(first.ActivityHistory, ActivityObservation{})
+
+	second, err := coordinator.Inspect("desktop")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(second.ActivityHistory) != 1 {
+		t.Fatalf("second ActivityHistory = %#v, want unaffected by first slice's append", second.ActivityHistory)
+	}
+	if second.ActivityHistory[0].Activity.LastTool != "original" || !second.ActivityHistory[0].SignalCurrent {
+		t.Fatalf("second ActivityHistory[0] = %#v, want unmutated by caller edits to the first result", second.ActivityHistory[0])
+	}
+}
+
+func TestInspectProcessTreeCarriesAssessmentAndRoleSummaries(t *testing.T) {
+	root := core.ProcessIdentity{PID: 1, CreatedAt: baseTime}
+	managed := core.Session{
+		ID:         "managed",
+		Tool:       core.ToolClaudeCLI,
+		Confidence: core.ConfidenceSupervised,
+		Root:       root,
+		StartedAt:  baseTime,
+		State:      core.StateRunning,
+		Processes:  []core.Process{{PID: 1, CreatedAt: baseTime, Name: "claude.exe", CPUAvailable: true, MemoryAvailable: true}},
+	}
+	coordinator := newCoordinator("workspace", &fakeStore{}, &fakeSupervisor{}, &fakeObserver{}, func() time.Time {
+		t.Fatal("Inspect called the coordinator clock")
+		return time.Time{}
+	})
+	coordinator.supervised = []core.Session{managed}
+
+	tree, err := coordinator.Inspect("managed")
+	if err != nil {
+		t.Fatalf("Inspect() error = %v", err)
+	}
+	wantAssessment := core.AssessSession(managed)
+	if !reflect.DeepEqual(tree.Assessment, wantAssessment) {
+		t.Fatalf("Assessment = %#v, want %#v", tree.Assessment, wantAssessment)
+	}
+	wantRoles := core.SummarizeProcessRoles(managed)
+	if !reflect.DeepEqual(tree.RoleSummaries, wantRoles) {
+		t.Fatalf("RoleSummaries = %#v, want %#v", tree.RoleSummaries, wantRoles)
+	}
+}

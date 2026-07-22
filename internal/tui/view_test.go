@@ -1033,11 +1033,17 @@ func TestInspectionShowsActivitySectionAboveCompactAndRawProcessRows(t *testing.
 		Label: "Codex agent host", ProcessCount: 1, PID: 42, ParentPID: 1, StartedAt: created,
 		Resources: core.ResourceUsage{CPUPercent: 7.5, MemoryBytes: 1572864, CPUAvailable: true, MemoryAvailable: true},
 	}}
-	tree.Session.Activities = []core.AgentActivity{{
-		ThreadID: "019f8390-4743-72a1-9df8-d780c4964fce", Workspace: `C:\Coding\taskwatch`,
-		Model: "gpt-5.6", LastTool: "exec", State: core.ActivityExecuting,
-		Correlation: core.CorrelationInferred, UpdatedAt: time.Date(2026, 7, 15, 3, 3, 5, 0, time.UTC),
-		ContextTokens: 82069, ContextWindow: 258400,
+	tree.ActivityHistory = []app.ActivityObservation{{
+		Activity: core.AgentActivity{
+			ThreadID: "019f8390-4743-72a1-9df8-d780c4964fce", Workspace: `C:\Coding\taskwatch`,
+			Model: "gpt-5.6", LastTool: "exec", State: core.ActivityExecuting,
+			Correlation:   core.CorrelationInferred,
+			ContextTokens: 82069, ContextWindow: 258400,
+		},
+		FirstObservedAt: time.Date(2026, 7, 15, 3, 3, 5, 0, time.UTC),
+		LastSignalAt:    time.Date(2026, 7, 15, 3, 3, 5, 0, time.UTC),
+		StateChangedAt:  time.Date(2026, 7, 15, 3, 3, 5, 0, time.UTC),
+		SignalCurrent:   true,
 	}}
 
 	for _, width := range []int{130, 60} {
@@ -1045,7 +1051,7 @@ func TestInspectionShowsActivitySectionAboveCompactAndRawProcessRows(t *testing.
 			model := inspectionTestModel(width, 30, tree, nil, false)
 			model.now = func() time.Time { return time.Date(2026, 7, 15, 3, 4, 5, 0, time.UTC) }
 			plain := flattenRendered(model.View().Content)
-			for _, want := range []string{"AGENT ACTIVITY", "019f8390", "executing", "exec", "gpt-5.6", "31.8%", "1m", "inferred", `C:\Coding\taskwatch`, "PROCESS TREE", "Codex agent host"} {
+			for _, want := range []string{"AGENT ACTIVITY", "019f8390", "Executing", "exec", "gpt-5.6", "31.8%", "1m", "inferred", `C:\Coding\taskwatch`, "PROCESS TREE", "Codex agent host"} {
 				if !strings.Contains(plain, want) {
 					t.Fatalf("width %d missing %q:\n%s", width, want, model.View().Content)
 				}
@@ -1068,17 +1074,44 @@ func TestInspectionShowsActivitySectionAboveCompactAndRawProcessRows(t *testing.
 }
 
 func TestActivityRowNeverRendersProcessResourceFields(t *testing.T) {
-	activity := core.AgentActivity{
-		ThreadID: "thread", State: core.ActivityThinking, LastTool: "pytest", Model: "gpt-5.6",
-		Correlation: core.CorrelationDirect, ContextTokens: 50, ContextWindow: 100,
+	observation := app.ActivityObservation{
+		Activity: core.AgentActivity{
+			ThreadID: "thread", State: core.ActivityThinking, LastTool: "pytest", Model: "gpt-5.6",
+			Correlation: core.CorrelationDirect, ContextTokens: 50, ContextWindow: 100,
+		},
+		LastSignalAt:   viewNow,
+		StateChangedAt: viewNow,
+		SignalCurrent:  true,
 	}
 	model := testModel(130, nil)
 	for _, width := range []int{130, 60} {
-		plain := flattenRendered(strings.Join(model.renderInspectionActivity(activity, width), "\n"))
+		plain := flattenRendered(strings.Join(model.renderInspectionActivity(observation, width), "\n"))
 		for _, forbidden := range []string{"PID", "CPU", "MEMORY", "procs"} {
 			if strings.Contains(plain, forbidden) {
 				t.Fatalf("activity width %d contains process field %q: %s", width, forbidden, plain)
 			}
+		}
+	}
+}
+
+func TestWideActivityRowKeepsHistoryMetadataAtMinimumWideWidth(t *testing.T) {
+	observation := app.ActivityObservation{
+		Activity: core.AgentActivity{
+			ThreadID: "019f8390-4743-72a1-9df8-d780c4964fce", Workspace: `C:\Coding\taskwatch`,
+			Model: "gpt-5.6", LastTool: "shell_command", State: core.ActivityExecuting,
+			Correlation: core.CorrelationInferred, ContextTokens: 82069, ContextWindow: 258400,
+		},
+		LastSignalAt:   viewNow.Add(-time.Minute),
+		StateChangedAt: viewNow.Add(-2 * time.Minute),
+		SignalCurrent:  false,
+	}
+	model := testModel(110, nil)
+	model.now = func() time.Time { return viewNow }
+
+	plain := flattenRendered(strings.Join(model.renderInspectionActivity(observation, 110), "\n"))
+	for _, want := range []string{`C:\Coding\taskwatch`, "state 2m ago", "retained"} {
+		if !strings.Contains(plain, want) {
+			t.Fatalf("minimum wide activity row missing %q: %s", want, plain)
 		}
 	}
 }
@@ -1175,7 +1208,23 @@ func TestInspectionViewportScrollsAndReportsHiddenRows(t *testing.T) {
 		rows[i].Process = core.Process{PID: uint32(i + 1), Name: fmt.Sprintf("process-%02d", i)}
 	}
 	model := inspectionTestModel(130, 9, inspectionTreeWithRows(rows), nil, false)
-	model.inspectionScrollOffset = 4
+
+	// Scroll the unified document to the exact line "process-04" first
+	// appears on, so scrolling past it hides earlier lines (including
+	// "process-00") while still showing an overflow indicator.
+	document := model.inspectionDocumentLines(130)
+	target := -1
+	for i, line := range document {
+		if strings.Contains(flattenRendered(line), "process-04") {
+			target = i
+			break
+		}
+	}
+	if target < 0 {
+		t.Fatal("process-04 not found in the unscrolled document")
+	}
+	model.inspectionScrollOffset = target
+
 	content := model.View().Content
 	plain := flattenRendered(content)
 
@@ -1213,7 +1262,7 @@ func TestInspectionResizeMatrixCapsWidthHeightAndKeepsFooterLast(t *testing.T) {
 func TestInspectionFooterAdvertisesOnlyReadOnlyInspectionKeys(t *testing.T) {
 	content := inspectionTestModel(130, 20, inspectionTreeWithRows(nil), nil, false).View().Content
 	plain := flattenRendered(content)
-	for _, want := range []string{"No termination keys", "↑/↓", "PgUp/PgDn", "t raw tree", "r refresh", "Enter/Esc back", "Ctrl+C"} {
+	for _, want := range []string{"READ ONLY", "no termination keys", "↑/↓", "PgUp/PgDn", "t raw tree", "r refresh", "Enter/Esc back", "Ctrl+C"} {
 		if !strings.Contains(plain, want) {
 			t.Fatalf("inspection footer missing %q:\n%s", want, content)
 		}
@@ -1221,6 +1270,168 @@ func TestInspectionFooterAdvertisesOnlyReadOnlyInspectionKeys(t *testing.T) {
 	for _, forbidden := range []string{"terminate", "kill", "q quit"} {
 		if strings.Contains(strings.ToLower(plain), forbidden) {
 			t.Fatalf("inspection footer advertises %q:\n%s", forbidden, content)
+		}
+	}
+}
+
+// TestInspectionSectionOrderIsContextAssessmentActivityResourcesThenTree
+// pins the single-document section order the plan mandates: session context,
+// then ASSESSMENT, then AGENT ACTIVITY, then RESOURCE BREAKDOWN, then the
+// process tree.
+func TestInspectionSectionOrderIsContextAssessmentActivityResourcesThenTree(t *testing.T) {
+	tree := inspectionTreeWithRows(nil)
+	tree.Assessment = core.SessionAssessment{Status: core.AssessmentOK, Label: "ACTIVE", Summary: "No cleanup suggested", Reasons: []string{"reason one"}}
+	tree.RoleSummaries = []core.ProcessRoleSummary{{Role: core.RoleAgentRuntime, ProcessCount: 2, Resources: core.ResourceUsage{CPUPercent: 1, MemoryBytes: 2048, CPUAvailable: true, MemoryAvailable: true}}}
+	model := inspectionTestModel(130, 40, tree, nil, false)
+	plain := flattenRendered(model.View().Content)
+
+	sections := []string{"Process Tree", "ASSESSMENT", "AGENT ACTIVITY", "RESOURCE BREAKDOWN", "PROCESS TREE"}
+	last := -1
+	for _, section := range sections {
+		index := strings.Index(plain, section)
+		if index == -1 {
+			t.Fatalf("missing section %q:\n%s", section, model.View().Content)
+		}
+		if index <= last {
+			t.Fatalf("section %q out of order (index %d <= previous %d):\n%s", section, index, last, model.View().Content)
+		}
+		last = index
+	}
+}
+
+func TestInspectionAssessmentAlwaysShowsReasonsAndStylesByStatus(t *testing.T) {
+	tests := []struct {
+		name       string
+		assessment core.SessionAssessment
+		whyHeading string
+	}{
+		{
+			name:       "active",
+			assessment: core.SessionAssessment{Status: core.AssessmentOK, Label: "ACTIVE", Summary: "No cleanup suggested", Reasons: []string{"identity present", "family validated"}},
+			whyHeading: "Why TaskWatch says this",
+		},
+		{
+			name:       "needs review",
+			assessment: core.SessionAssessment{Status: core.AssessmentNeedsReview, Label: "NEEDS REVIEW", Summary: "12 validated processes remain", Reasons: []string{"identity gone", "job object membership validated"}},
+			whyHeading: "Why TaskWatch flagged this",
+		},
+		{
+			name:       "unknown",
+			assessment: core.SessionAssessment{Status: core.AssessmentUnknown, Label: "UNKNOWN", Summary: "Evidence unreadable", Reasons: []string{"could not refresh evidence"}},
+			whyHeading: "Why TaskWatch flagged this",
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			tree := inspectionTreeWithRows(nil)
+			tree.Assessment = tc.assessment
+			model := inspectionTestModel(130, 40, tree, nil, false)
+			plain := flattenRendered(model.View().Content)
+			for _, want := range append([]string{tc.assessment.Label, tc.assessment.Summary, tc.whyHeading}, tc.assessment.Reasons...) {
+				if !strings.Contains(plain, want) {
+					t.Fatalf("%s: missing %q:\n%s", tc.name, want, model.View().Content)
+				}
+			}
+			for _, reason := range tc.assessment.Reasons {
+				if !strings.Contains(plain, "• "+reason) {
+					t.Fatalf("%s: reason %q not bulleted:\n%s", tc.name, reason, model.View().Content)
+				}
+			}
+		})
+	}
+}
+
+func TestInspectionActivitySectionCodexRetainedVsCurrentAndNoHistoryPlaceholder(t *testing.T) {
+	base := inspectionTreeWithRows(nil)
+	base.Session.Tool = core.ToolCodexCLI
+
+	t.Run("current", func(t *testing.T) {
+		tree := base
+		tree.ActivityHistory = []app.ActivityObservation{{
+			Activity:       core.AgentActivity{ThreadID: "current-thread-id", State: core.ActivityExecuting},
+			LastSignalAt:   viewNow,
+			StateChangedAt: viewNow,
+			SignalCurrent:  true,
+		}}
+		model := inspectionTestModel(130, 40, tree, nil, false)
+		plain := flattenRendered(model.View().Content)
+		if !strings.Contains(plain, "current") {
+			t.Fatalf("current observation missing currency marker:\n%s", model.View().Content)
+		}
+	})
+
+	t.Run("retained", func(t *testing.T) {
+		tree := base
+		tree.ActivityHistory = []app.ActivityObservation{{
+			Activity:       core.AgentActivity{ThreadID: "retained-thread-id", State: core.ActivityExecuting},
+			LastSignalAt:   viewNow,
+			StateChangedAt: viewNow,
+			SignalCurrent:  false,
+		}}
+		model := inspectionTestModel(130, 40, tree, nil, false)
+		plain := flattenRendered(model.View().Content)
+		if !strings.Contains(plain, "retained") {
+			t.Fatalf("retained observation missing currency marker:\n%s", model.View().Content)
+		}
+	})
+
+	t.Run("codex no history", func(t *testing.T) {
+		tree := base
+		tree.ActivityHistory = nil
+		model := inspectionTestModel(130, 40, tree, nil, false)
+		plain := flattenRendered(model.View().Content)
+		if !strings.Contains(plain, "No Codex activity observed during this TaskWatch run.") {
+			t.Fatalf("missing Codex no-history placeholder:\n%s", model.View().Content)
+		}
+		if strings.Contains(strings.ToLower(plain), "idle") {
+			t.Fatalf("missing activity rendered as idle:\n%s", model.View().Content)
+		}
+	})
+
+	t.Run("claude unavailable", func(t *testing.T) {
+		tree := base
+		tree.Session.Tool = core.ToolClaudeCLI
+		tree.ActivityHistory = nil
+		model := inspectionTestModel(130, 40, tree, nil, false)
+		plain := flattenRendered(model.View().Content)
+		if !strings.Contains(plain, "Activity signal unavailable for Claude in this preview.") {
+			t.Fatalf("missing Claude-unavailable placeholder:\n%s", model.View().Content)
+		}
+	})
+}
+
+func TestInspectionResourceBreakdownShowsRolesCountsAndResourcesAtWideAndNarrowWidths(t *testing.T) {
+	tree := inspectionTreeWithRows(nil)
+	tree.RoleSummaries = []core.ProcessRoleSummary{
+		{Role: core.RoleAgentRuntime, ProcessCount: 2, Resources: core.ResourceUsage{CPUPercent: 5.5, MemoryBytes: 141557760, CPUAvailable: true, MemoryAvailable: true}},
+		{Role: core.RoleShellCommand, ProcessCount: 12, Resources: core.ResourceUsage{CPUPercent: 1.2, MemoryBytes: 44040192, CPUAvailable: true, MemoryAvailable: true}},
+	}
+	for _, width := range []int{130, 60} {
+		t.Run(fmt.Sprintf("width_%d", width), func(t *testing.T) {
+			model := inspectionTestModel(width, 40, tree, nil, false)
+			content := model.View().Content
+			plain := flattenRendered(content)
+			for _, want := range []string{"RESOURCE BREAKDOWN · 14 PROCESSES ACROSS 2 ROLES", "Agent runtime", "Shell commands", "5.5%", "135.0 MB", "42.0 MB"} {
+				if !strings.Contains(plain, want) {
+					t.Fatalf("width %d missing %q:\n%s", width, want, content)
+				}
+			}
+			assertWithinWidth(t, content, width)
+		})
+	}
+}
+
+func TestInspectionNoTerminationKeyIsHandledInInspection(t *testing.T) {
+	tree := inspectionTreeWithRows(nil)
+	model := inspectionTestModel(130, 20, tree, nil, false)
+	for _, name := range []string{"k", "delete", "x", "q"} {
+		before := model.View().Content
+		next, cmd := update(t, model, key(name))
+		if cmd != nil {
+			t.Fatalf("key %q returned a command from inspection", name)
+		}
+		if next.View().Content != before {
+			t.Fatalf("key %q changed inspection rendering, want no-op", name)
 		}
 	}
 }

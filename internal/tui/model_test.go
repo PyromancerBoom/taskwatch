@@ -1346,13 +1346,21 @@ func TestInspectionToggleSwitchesRawAndCompactRowsAndResetsScroll(t *testing.T) 
 	model.inspectionScrollOffset = 1
 
 	model, cmd := update(t, model, key("t"))
-	if cmd != nil || !model.inspectionRaw || model.inspectionScrollOffset != 0 || model.inspectionRowCount() != len(raw) {
+	if cmd != nil || !model.inspectionRaw || model.inspectionScrollOffset != 0 {
 		t.Fatalf("raw toggle: cmd=%v raw=%v offset=%d rows=%d", cmd, model.inspectionRaw, model.inspectionScrollOffset, model.inspectionRowCount())
+	}
+	rawDocumentLines := model.inspectionRowCount()
+	if rawDocumentLines <= len(raw) {
+		t.Fatalf("raw document lines = %d, want process rows plus inspection context", rawDocumentLines)
 	}
 	model.inspectionScrollOffset = 5
 	model, cmd = update(t, model, key("t"))
-	if cmd != nil || model.inspectionRaw || model.inspectionScrollOffset != 0 || model.inspectionRowCount() != len(compact) {
+	if cmd != nil || model.inspectionRaw || model.inspectionScrollOffset != 0 {
 		t.Fatalf("compact toggle: cmd=%v raw=%v offset=%d rows=%d", cmd, model.inspectionRaw, model.inspectionScrollOffset, model.inspectionRowCount())
+	}
+	compactDocumentLines := model.inspectionRowCount()
+	if compactDocumentLines <= len(compact) || compactDocumentLines >= rawDocumentLines {
+		t.Fatalf("compact document lines = %d, want context plus fewer rows than raw document %d", compactDocumentLines, rawDocumentLines)
 	}
 }
 
@@ -1381,9 +1389,13 @@ func TestInspectionToggleIsBlockedWhileLoadingAndNewInspectionResetsCompactMode(
 func TestActivityInspectionUsesCombinedViewportAndPreservesModeAcrossRefresh(t *testing.T) {
 	now := time.Date(2026, 7, 21, 12, 0, 0, 0, time.UTC)
 	sessionWithActivity := session("one")
+	var history []app.ActivityObservation
 	for i := 0; i < 4; i++ {
-		sessionWithActivity.Activities = append(sessionWithActivity.Activities, core.AgentActivity{
-			ThreadID: fmt.Sprintf("thread-%d", i), State: core.ActivityThinking, UpdatedAt: now.Add(time.Duration(i) * time.Second),
+		history = append(history, app.ActivityObservation{
+			Activity:       core.AgentActivity{ThreadID: fmt.Sprintf("thread-%d", i), State: core.ActivityThinking},
+			LastSignalAt:   now.Add(time.Duration(i) * time.Second),
+			StateChangedAt: now.Add(time.Duration(i) * time.Second),
+			SignalCurrent:  true,
 		})
 	}
 	raw := make([]core.ProcessTreeRow, 12)
@@ -1394,7 +1406,7 @@ func TestActivityInspectionUsesCombinedViewportAndPreservesModeAcrossRefresh(t *
 	model.height = 12
 	model.screen = screenInspection
 	model.inspectionSessionID = "one"
-	model.inspectionTree = app.ProcessTree{Session: sessionWithActivity, Rows: raw, CompactRows: compact}
+	model.inspectionTree = app.ProcessTree{Session: sessionWithActivity, ActivityHistory: history, Rows: raw, CompactRows: compact}
 
 	combined := model.inspectionRowCount()
 	if combined <= len(compact) {
@@ -1419,8 +1431,13 @@ func TestActivityInspectionUsesCombinedViewportAndPreservesModeAcrossRefresh(t *
 
 	model.inspectionScrollOffset = 100
 	refreshedSession := session("one")
-	refreshedSession.Activities = []core.AgentActivity{{ThreadID: "fresh", State: core.ActivityWaiting, UpdatedAt: now}}
-	model.applyInspectionResult(app.ProcessTree{Session: refreshedSession, Rows: raw[:1], CompactRows: compact[:1]}, nil, true)
+	refreshedHistory := []app.ActivityObservation{{
+		Activity:       core.AgentActivity{ThreadID: "fresh", State: core.ActivityWaiting},
+		LastSignalAt:   now,
+		StateChangedAt: now,
+		SignalCurrent:  true,
+	}}
+	model.applyInspectionResult(app.ProcessTree{Session: refreshedSession, ActivityHistory: refreshedHistory, Rows: raw[:1], CompactRows: compact[:1]}, nil, true)
 	if !model.inspectionRaw {
 		t.Fatal("refresh reset the selected raw projection")
 	}
@@ -1534,8 +1551,8 @@ func TestInspectionScrollingAndResizeRefreshClamping(t *testing.T) {
 	for i := 0; i < 30; i++ {
 		model, _ = update(t, model, key("down"))
 	}
-	if model.inspectionScrollOffset <= 0 || model.inspectionScrollOffset >= len(rows) {
-		t.Fatalf("down offset = %d, want clamped within process rows", model.inspectionScrollOffset)
+	if model.inspectionScrollOffset <= 0 || model.inspectionScrollOffset >= model.inspectionRowCount() {
+		t.Fatalf("down offset = %d, want clamped within the document (%d lines)", model.inspectionScrollOffset, model.inspectionRowCount())
 	}
 	for i := 0; i < 30; i++ {
 		model, _ = update(t, model, key("pgup"))
@@ -1564,8 +1581,11 @@ func TestInspectionScrollingAndResizeRefreshClamping(t *testing.T) {
 		t.Fatal("inspection refresh returned nil command")
 	}
 	model, _ = update(t, model, refreshCmd())
-	if model.inspectionScrollOffset != 0 || len(model.inspectionTree.Rows) != 2 {
-		t.Fatalf("refresh clamp: offset=%d rows=%d", model.inspectionScrollOffset, len(model.inspectionTree.Rows))
+	if len(model.inspectionTree.Rows) != 2 {
+		t.Fatalf("refresh did not install the smaller tree: rows=%d", len(model.inspectionTree.Rows))
+	}
+	if model.inspectionScrollOffset < 0 || model.inspectionScrollOffset >= model.inspectionRowCount() {
+		t.Fatalf("refresh clamp: offset=%d, want within shrunk document (%d lines)", model.inspectionScrollOffset, model.inspectionRowCount())
 	}
 }
 
@@ -1583,10 +1603,15 @@ func TestInspectionErrorBudgetKeepsPageSizeAndFinalRowReachable(t *testing.T) {
 	model.inspectionTree = app.ProcessTree{Session: session("one"), Rows: rows}
 	model.inspectionErr = errors.New("sampling denied")
 
-	if got := model.inspectionPageSize(); got != 2 {
-		t.Fatalf("inspectionPageSize() = %d, want 2 after reserving the retained-error line", got)
+	withError := model.inspectionPageSize()
+	withoutError := model
+	withoutError.inspectionErr = nil
+	if got := withoutError.inspectionPageSize(); withError >= got {
+		t.Fatalf("inspectionPageSize() with retained error = %d, want less than without it (%d)", withError, got)
 	}
-	for i := 0; i < len(rows)+2; i++ {
+
+	total := model.inspectionRowCount()
+	for i := 0; i < total+2; i++ {
 		model, _ = update(t, model, key("down"))
 	}
 

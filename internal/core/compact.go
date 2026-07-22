@@ -219,6 +219,11 @@ func earliestProcessStart(processes []Process) time.Time {
 	return earliest
 }
 
+// friendlyProcessLabel derives a compact display label from the same
+// classifyProcessRole result used for role summaries, so the two views can
+// never describe a process differently. Roles that admit more than one
+// compact label are refined by the original, more specific command-line
+// checks; every refinement stays within its classified role.
 func friendlyProcessLabel(process Process, tool Tool, root bool) (string, bool) {
 	if root {
 		switch tool {
@@ -231,26 +236,33 @@ func friendlyProcessLabel(process Process, tool Tool, root bool) (string, bool) 
 
 	name := strings.ToLower(filepath.Base(process.Name))
 	commandLine := strings.ToLower(process.CommandLine)
-	switch {
-	case strings.Contains(commandLine, "code-mode") || strings.Contains(commandLine, "code_mode"):
-		return "Code-mode host", true
-	case isNodeExecutable(name) && strings.Contains(commandLine, "mcp-server"):
-		return "MCP server", true
-	case strings.Contains(commandLine, "playwright"):
+
+	switch classifyProcessRole(process, tool, root) {
+	case RoleAgentRuntime:
+		if strings.Contains(commandLine, "code-mode") || strings.Contains(commandLine, "code_mode") {
+			return "Code-mode host", true
+		}
+	case RoleBrowserAutomation:
 		return "Browser tests", true
-	case strings.Contains(commandLine, "pytest"):
+	case RoleMCPToolServer:
+		return "MCP server", true
+	case RoleTestRunner:
 		return "Test run", true
-	case strings.Contains(commandLine, "tsserver"):
+	case RoleCodeIntelligence:
 		return "Code intel", true
-	case name == "git" || name == "git.exe":
-		return "Git", true
-	case isPackageExecutable(name) || containsAny(commandLine, "npm-cli.js", "npx-cli.js", "pnpm.cjs", "yarn.js"):
-		return "Package script", true
-	case isNodeExecutable(name) && commandNamesExecutableOnly(process.CommandLine, name):
-		return "Node REPL", true
-	default:
-		return process.Name, false
+	case RoleShellCommand:
+		if name == "git" || name == "git.exe" {
+			return "Git", true
+		}
+		if isPackageExecutable(name) || containsAny(commandLine, "npm-cli.js", "npx-cli.js", "pnpm.cjs", "yarn.js") {
+			return "Package script", true
+		}
 	}
+
+	if isNodeExecutable(name) && commandNamesExecutableOnly(process.CommandLine, name) {
+		return "Node REPL", true
+	}
+	return process.Name, false
 }
 
 func isNodeExecutable(name string) bool {

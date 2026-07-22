@@ -68,35 +68,57 @@ type LaunchResult struct {
 }
 
 type ProcessTree struct {
-	Session     core.Session
-	Rows        []core.ProcessTreeRow
-	CompactRows []core.CompactProcessRow
+	Session         core.Session
+	Assessment      core.SessionAssessment
+	RoleSummaries   []core.ProcessRoleSummary
+	ActivityHistory []ActivityObservation
+	Rows            []core.ProcessTreeRow
+	CompactRows     []core.CompactProcessRow
+}
+
+// ActivityObservation tracks TaskWatch's own in-memory observation history for
+// one Codex activity thread. It is process-local only: never persisted, and
+// never fed into core.AssessSession.
+type ActivityObservation struct {
+	Activity        core.AgentActivity
+	FirstObservedAt time.Time
+	LastSignalAt    time.Time
+	StateChangedAt  time.Time
+	SignalCurrent   bool
 }
 
 type Coordinator struct {
-	mu                sync.Mutex
-	closed            bool
-	baseDir           string
-	store             SessionStore
-	supervisor        Supervisor
-	observer          Observer
-	activityCollector ActivityCollector
-	selfIdentity      core.ProcessIdentity
-	now               func() time.Time
-	resolveWorkspace  func(string, string) (string, error)
-	supervised        []core.Session
-	observed          []core.Session
-	recentWorkspaces  []string
-	warnings          []Warning
-	refreshed         time.Time
-	persistenceDirty  bool
-	activityMatches   map[string]activityMatch
+	mu                   sync.Mutex
+	closed               bool
+	baseDir              string
+	store                SessionStore
+	supervisor           Supervisor
+	observer             Observer
+	activityCollector    ActivityCollector
+	selfIdentity         core.ProcessIdentity
+	now                  func() time.Time
+	resolveWorkspace     func(string, string) (string, error)
+	supervised           []core.Session
+	observed             []core.Session
+	recentWorkspaces     []string
+	warnings             []Warning
+	refreshed            time.Time
+	persistenceDirty     bool
+	activityMatches      map[string]activityMatch
+	activityObservations map[string]*sessionObservations
 }
 
 type activityMatch struct {
 	Root      core.ProcessIdentity
 	ThreadID  string
 	Workspace string
+}
+
+// sessionObservations is one Codex session's in-memory activity history,
+// keyed by lowercased thread ID.
+type sessionObservations struct {
+	root     core.ProcessIdentity
+	byThread map[string]*ActivityObservation
 }
 
 // maxRecentWorkspaces caps the persisted recent-workspaces list.
@@ -122,14 +144,15 @@ func newCoordinator(baseDir string, store SessionStore, supervisor Supervisor, o
 
 func newCoordinatorWithActivity(baseDir string, store SessionStore, supervisor Supervisor, observer Observer, collector ActivityCollector, now func() time.Time) *Coordinator {
 	return &Coordinator{
-		baseDir:           baseDir,
-		store:             store,
-		supervisor:        supervisor,
-		observer:          observer,
-		activityCollector: collector,
-		now:               now,
-		resolveWorkspace:  resolveWorkspace,
-		activityMatches:   make(map[string]activityMatch),
+		baseDir:              baseDir,
+		store:                store,
+		supervisor:           supervisor,
+		observer:             observer,
+		activityCollector:    collector,
+		now:                  now,
+		resolveWorkspace:     resolveWorkspace,
+		activityMatches:      make(map[string]activityMatch),
+		activityObservations: make(map[string]*sessionObservations),
 	}
 }
 
@@ -252,6 +275,7 @@ func (coordinator *Coordinator) Start() (Snapshot, error) {
 	coordinator.observed = nil
 	coordinator.warnings = nil
 	clear(coordinator.activityMatches)
+	clear(coordinator.activityObservations)
 
 	recent, recentErr := coordinator.store.LoadRecentWorkspaces()
 	if recentErr != nil {
@@ -292,6 +316,7 @@ func (coordinator *Coordinator) Start() (Snapshot, error) {
 
 	refreshedAt := coordinator.now()
 	coordinator.collectActivities(refreshedAt)
+	coordinator.recordActivityObservations(refreshedAt)
 
 	if exited {
 		if err := coordinator.store.Save(cloneSessions(coordinator.persistedSessions())); err != nil {
@@ -361,6 +386,7 @@ func (coordinator *Coordinator) Refresh() Snapshot {
 	}
 	refreshedAt := coordinator.now()
 	coordinator.collectActivities(refreshedAt)
+	coordinator.recordActivityObservations(refreshedAt)
 
 	if newlyExited || coordinator.persistenceDirty {
 		if err := coordinator.store.Save(cloneSessions(coordinator.persistedSessions())); err != nil {
@@ -404,10 +430,37 @@ func (coordinator *Coordinator) Inspect(sessionID string) (ProcessTree, error) {
 	session := cloneSession(*found)
 	rows := core.CollectProcessForest(session.Processes)
 	return ProcessTree{
-		Session:     session,
-		Rows:        rows,
-		CompactRows: core.BuildCompactProcessForest(session, rows),
+		Session:         session,
+		Assessment:      core.AssessSession(session),
+		RoleSummaries:   core.SummarizeProcessRoles(session),
+		ActivityHistory: coordinator.activityHistory(sessionID),
+		Rows:            rows,
+		CompactRows:     core.BuildCompactProcessForest(session, rows),
 	}, nil
+}
+
+// activityHistory returns a defensive copy of the in-memory activity
+// observations recorded for sessionID, sorted deterministically (most recent
+// signal first, then thread ID). ActivityObservation holds only scalar and
+// string fields plus a value core.AgentActivity (itself all scalar/string/
+// time), so copying each struct by value fully isolates the caller from
+// coordinator state.
+func (coordinator *Coordinator) activityHistory(sessionID string) []ActivityObservation {
+	entry, ok := coordinator.activityObservations[sessionID]
+	if !ok || len(entry.byThread) == 0 {
+		return []ActivityObservation{}
+	}
+	history := make([]ActivityObservation, 0, len(entry.byThread))
+	for _, observed := range entry.byThread {
+		history = append(history, *observed)
+	}
+	sort.SliceStable(history, func(i, j int) bool {
+		if history[i].LastSignalAt.Equal(history[j].LastSignalAt) {
+			return history[i].Activity.ThreadID < history[j].Activity.ThreadID
+		}
+		return history[i].LastSignalAt.After(history[j].LastSignalAt)
+	})
+	return history
 }
 
 func (coordinator *Coordinator) Close() {
@@ -599,6 +652,94 @@ func (coordinator *Coordinator) attachActivities(activities []core.AgentActivity
 		if activity, ok := nearestActivity(available, assigned, session.StartedAt, time.Minute); ok {
 			assign(session, activity, core.CorrelationInferred)
 		}
+	}
+}
+
+// isCodexSession reports whether a session belongs to a Codex tool (CLI or
+// Desktop), the only tools that produce AgentActivity signals worth tracking.
+func isCodexSession(session core.Session) bool {
+	return session.Tool == core.ToolCodexCLI || session.Tool == core.ToolCodexDesktop
+}
+
+// signalTime is the Codex-reported signal time for an activity, falling back
+// to the wall clock when Codex did not supply one.
+func signalTime(activity core.AgentActivity, now time.Time) time.Time {
+	if activity.UpdatedAt.IsZero() {
+		return now
+	}
+	return activity.UpdatedAt
+}
+
+// recordActivityObservations maintains the in-memory activity history used by
+// session inspection. It must be called after collectActivities so it reads
+// the post-attach, window-filtered session.Activities. It never influences
+// core.AssessSession.
+func (coordinator *Coordinator) recordActivityObservations(now time.Time) {
+	present := make(map[string]struct{}, len(coordinator.supervised)+len(coordinator.observed))
+	for _, session := range coordinator.supervised {
+		present[session.ID] = struct{}{}
+	}
+	for _, session := range coordinator.observed {
+		present[session.ID] = struct{}{}
+	}
+	for id := range coordinator.activityObservations {
+		if _, ok := present[id]; !ok {
+			delete(coordinator.activityObservations, id)
+		}
+	}
+
+	record := func(session *core.Session) {
+		if !isCodexSession(*session) {
+			return
+		}
+		entry, exists := coordinator.activityObservations[session.ID]
+		if exists && !core.SameProcess(entry.root, session.Root) {
+			exists = false
+		}
+		if !exists {
+			entry = &sessionObservations{byThread: make(map[string]*ActivityObservation)}
+			coordinator.activityObservations[session.ID] = entry
+		}
+		entry.root = session.Root
+
+		for _, observed := range entry.byThread {
+			observed.SignalCurrent = false
+		}
+
+		for _, activity := range session.Activities {
+			if activity.ThreadID == "" {
+				continue
+			}
+			key := strings.ToLower(activity.ThreadID)
+			existing, ok := entry.byThread[key]
+			if !ok {
+				at := signalTime(activity, now)
+				entry.byThread[key] = &ActivityObservation{
+					Activity:        activity,
+					FirstObservedAt: now,
+					LastSignalAt:    at,
+					StateChangedAt:  at,
+					SignalCurrent:   true,
+				}
+				continue
+			}
+			existing.SignalCurrent = true
+			if activity.UpdatedAt.After(existing.Activity.UpdatedAt) {
+				at := signalTime(activity, now)
+				existing.LastSignalAt = at
+				if activity.State != existing.Activity.State {
+					existing.StateChangedAt = at
+				}
+				existing.Activity = activity
+			}
+		}
+	}
+
+	for i := range coordinator.supervised {
+		record(&coordinator.supervised[i])
+	}
+	for i := range coordinator.observed {
+		record(&coordinator.observed[i])
 	}
 }
 

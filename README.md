@@ -7,6 +7,7 @@ TaskWatch v0.1.0-preview is a Windows 10/11 x64 technical preview for inspecting
 - Read-only auto-detection of the packaged Codex Desktop application and external Codex CLI agent processes.
 - Supervised launches of Claude Code and Codex CLI from a workspace you choose in TaskWatch.
 - Recent, redacted Codex activity (state, tool, model, and context usage) from active rollout files.
+- Human-readable session inspection: an advisory lifecycle assessment, semantic process-role breakdown, current-run Codex activity, and the exact process tree.
 - Read-only process-tree inspection, refresh, and restart recovery for eligible supervised sessions.
 
 For Job Object supervision, launch Claude Code or Codex CLI through TaskWatch. Existing Codex CLI processes are detected automatically but remain observed and ephemeral; they are never adopted into supervision. Existing Claude Code processes are not discovered.
@@ -41,10 +42,16 @@ In the terminal UI:
 
 - Press `c` to launch Claude Code, or `x` to launch Codex CLI.
 - Choose a workspace (or enter one) for that new session.
-- Press `Enter` to inspect the selected session in a compact, friendly process tree.
+- Press `Enter` to inspect the selected session. Inspection is one scrollable document: session context, an advisory assessment, current-run Codex activity, a semantic resource breakdown, and the process tree.
 - Press `t` during inspection to toggle the exact raw process tree.
 - Press `r` to refresh immediately.
 - Press `Ctrl+C` to close TaskWatch. It leaves all processes running.
+
+### Reading an inspection
+
+- **Assessment** is advisory only and never offers a cleanup action. `ACTIVE` and `FINISHED` mean no cleanup is suggested; `NEEDS REVIEW` appears *only* for a proven supervised leftover (a session TaskWatch launched whose original process exited while validated members of its Job Object remain); `UNKNOWN` covers stale, inaccessible, or internally inconsistent sessions. Every verdict lists the exact reasons TaskWatch reached it, and the assessment is derived purely from lifecycle state and exact process identity — activity and role labels never influence it.
+- **Semantic roles** group each validated process into exactly one role (agent runtime, shell command, test runner, development server, browser automation, MCP/tool server, code intelligence, or background helper). Role counts and resource totals always add up to the session's exact process set; the labels are display-only.
+- **Agent activity** history is Codex-only and kept in memory for the current TaskWatch run: it survives a Codex signal briefly leaving the 15-minute rollout window (shown as retained rather than current) but is never persisted and resets when the session or its root identity changes, or when TaskWatch restarts. Claude inspection states that the activity signal is unavailable in this preview. Missing activity is never rendered as idle, finished, or safe to stop.
 
 Command-line information is also available without opening the UI:
 
@@ -75,7 +82,7 @@ Observed Codex Desktop/CLI sessions and rollout activity are deliberately not pe
 
 ## Safety
 
-TaskWatch exposes no process-cleanup or termination action in this preview. Its inspection views and rollout enrichment are read-only. Activity correlation, including visibly labeled inferred matches, never changes process identity, lifecycle, resources, persistence, or any future termination decision. Closing TaskWatch does not close supervised applications, and the Job Objects it uses are not configured to kill processes when TaskWatch exits.
+TaskWatch exposes no process-cleanup or termination action in this preview. Its inspection views and rollout enrichment are read-only. The advisory assessment (including `NEEDS REVIEW`), semantic role labels, and activity history are display-only: they add no cleanup key, confirmation flow, or termination target. Activity correlation, including visibly labeled inferred matches, never changes process identity, lifecycle, resources, persistence, or any future termination decision. Closing TaskWatch does not close supervised applications, and the Job Objects it uses are not configured to kill processes when TaskWatch exits.
 
 The project’s safety model is designed around exact process identity (PID plus creation time), conservative handling of unreadable metadata, and explicit user confirmation before any future termination capability could be made available.
 
